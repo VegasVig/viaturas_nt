@@ -412,11 +412,23 @@ function setApiUrl(u){
 async function api(acao, payload){
   if(!API_URL) throw new Error("API não configurada");
   const body = Object.assign({acao}, payload||{});
-  const resp = await fetch(API_URL, {
-    method:"POST",
-    headers:{"Content-Type":"text/plain;charset=utf-8"},
-    body: JSON.stringify(body)
-  });
+  // timeout: fotos podem ser grandes, então damos mais tempo a elas.
+  const limite = acao==="foto" ? 30000 : 15000;
+  const ctrl = new AbortController();
+  const t = setTimeout(()=>ctrl.abort(), limite);
+  let resp;
+  try{
+    resp = await fetch(API_URL, {
+      method:"POST",
+      headers:{"Content-Type":"text/plain;charset=utf-8"},
+      body: JSON.stringify(body),
+      signal: ctrl.signal
+    });
+  }catch(e){
+    clearTimeout(t);
+    throw new Error(e.name==="AbortError" ? "Tempo esgotado na conexão" : "Falha de conexão");
+  }
+  clearTimeout(t);
   const txt = await resp.text();
   let j; try{ j=JSON.parse(txt); }catch(e){ throw new Error("Resposta inválida do servidor"); }
   if(!j.ok && j.erro) throw new Error(j.erro);
@@ -1276,7 +1288,9 @@ async function verFotosMov(ref){
     const r=DB.retiradas.find(x=>x.id===id); if(!r){toast("Registro não encontrado");return;}
     titulo="Fotos da retirada";
     FOTOS_ITENS.forEach(([k,l])=>{ if(r.fotos?.[k]) pares.push([l, r.fotos[k]]); });
-    if(r.fotos?.avaria) pares.push(["Avaria", r.fotos.avaria]);
+    // fotos de avaria (novo formato: array em avaria.fotosRefs; formato antigo: fotos.avaria)
+    if(r.avaria?.fotosRefs?.length) r.avaria.fotosRefs.forEach((ref,i)=>pares.push(["Avaria "+(i+1), ref]));
+    else if(r.fotos?.avaria) pares.push(["Avaria", r.fotos.avaria]);
   } else if(tipo==="dev"){
     const d=DB.devolucoes.find(x=>x.id===id); if(!d){toast("Registro não encontrado");return;}
     titulo="Fotos da devolução";
@@ -1533,6 +1547,12 @@ ROUTES.map=(el)=>{
 
 const CHECKLIST_ITENS=["Pneus","Estepe","Macaco","Chave de roda","Triângulo","Extintor","Faróis","Lanternas","Setas","Luz de freio","Buzina","Limpadores","Retrovisores","Cintos","Vidros","Para-brisa","Lataria","Portas","Interior","Documentação","Equipamentos obrigatórios"];
 const FOTOS_ITENS=[["frente","Frente","🚗"],["traseira","Traseira","🔙"],["direito","Lado direito","➡️"],["esquerdo","Lado esquerdo","⬅️"],["painel","Painel/KM","📊"],["agua","Água","💧"],["oleo","Óleo","🛢️"]];
+// Fotos exibidas na etapa "Fotos" da RETIRADA (água/óleo são opcionais aqui).
+const FOTOS_RET=FOTOS_ITENS;
+// Fotos da DEVOLUÇÃO: sem água/óleo (motor quente).
+const FOTOS_DEV=FOTOS_ITENS.filter(([k])=>k!=="agua"&&k!=="oleo");
+// Fotos OBRIGATÓRIAS (as demais são opcionais): carroceria + painel.
+const FOTOS_OBRIGATORIAS=["frente","traseira","direito","esquerdo","painel"];
 const NIVEL_COMB=["Reserva","1/4","1/2","3/4","Cheio"];
 
 /* estado do wizard (rascunho salvo) */
@@ -1594,7 +1614,7 @@ function startRetirada(){
     motoristaId:SESSION.tipo==="motorista"?SESSION.id:"",
     veiculoId:"",destinoId:"",destinoNome:"",finalidade:"",kmInicial:"",
     nivelComb:"",checklist:{},niveisAgua:"",niveisOleo:"",
-    fotos:{},avaria:{tem:false,desc:"",areas:[]},termo:false,
+    fotos:{},avaria:{tem:false,desc:"",areas:[],fotos:[]},termo:false,
     lat:null,lng:null};
   wzSave(); renderWizard();
 }
@@ -1728,11 +1748,11 @@ function bindChkPhoto(i){ bindPhotoKey("chk"+i,(url)=>{WZ.checklist[i]=WZ.checkl
 /* etapa 6 - níveis água/óleo */
 function stNiveis(b){
   const opt=["Normal","Baixo","Necessita completar"];
-  b.innerHTML=`<h3>Níveis do veículo</h3><p class="desc">Verifique água e óleo. Fotos obrigatórias.</p>
+  b.innerHTML=`<h3>Níveis do veículo</h3><p class="desc">Verifique água e óleo. Fotos opcionais.</p>
     <label>💧 Água</label><div class="pill-row">${opt.map(o=>`<button class="${WZ.niveisAgua===o?"on":""}" onclick="setNivel('agua','${o}')">${o}</button>`).join("")}</div>
-    <div style="margin-top:12px">${photoSlotHTML("agua","Foto do nível de água","💧",WZ.fotos.agua)}</div>
+    <div style="margin-top:12px">${photoSlotHTML("agua","Foto do nível de água (opcional)","💧",WZ.fotos.agua)}</div>
     <label style="margin-top:18px">🛢️ Óleo</label><div class="pill-row">${opt.map(o=>`<button class="${WZ.niveisOleo===o?"on":""}" onclick="setNivel('oleo','${o}')">${o}</button>`).join("")}</div>
-    <div style="margin-top:12px">${photoSlotHTML("oleo","Foto da vareta de óleo","🛢️",WZ.fotos.oleo)}</div>
+    <div style="margin-top:12px">${photoSlotHTML("oleo","Foto da vareta de óleo (opcional)","🛢️",WZ.fotos.oleo)}</div>
     ${wzNav()}`;
   bindPhoto("agua");bindPhoto("oleo");
 }
@@ -1740,10 +1760,13 @@ function setNivel(k,v){ if(k==="agua")WZ.niveisAgua=v;else WZ.niveisOleo=v; wzSa
 
 /* etapa 7 - fotos obrigatórias */
 function stFotos(b){
-  b.innerHTML=`<h3>Fotos do veículo</h3><p class="desc">Tire as fotos pela câmera. Todas são obrigatórias.</p>
-    <div class="photo-grid">${FOTOS_ITENS.map(([k,l,e])=>photoSlotHTML(k,l,e,WZ.fotos[k])).join("")}</div>
+  b.innerHTML=`<h3>Fotos do veículo</h3><p class="desc">Frente, traseira, laterais e painel são obrigatórias. Água e óleo são opcionais.</p>
+    <div class="photo-grid">${FOTOS_RET.map(([k,l,e])=>{
+      const opcional=!FOTOS_OBRIGATORIAS.includes(k);
+      return photoSlotHTML(k,l+(opcional?" (opcional)":""),e,WZ.fotos[k]);
+    }).join("")}</div>
     ${wzNav()}`;
-  FOTOS_ITENS.forEach(([k])=>bindPhoto(k));
+  FOTOS_RET.forEach(([k])=>bindPhoto(k));
 }
 
 /* etapa 8 - avarias */
@@ -1757,10 +1780,38 @@ function stAvarias(b){
       <label>Descrição da avaria</label><textarea id="av-desc" oninput="WZ.avaria.desc=this.value;wzSave()">${esc(WZ.avaria.desc)}</textarea>
       <label>Áreas afetadas</label>
       <div class="pill-row">${areas.map(a=>`<button class="${WZ.avaria.areas.includes(a)?"on":""}" onclick="toggleArea('${a}')">${a}</button>`).join("")}</div>
-      <div style="margin-top:12px">${photoSlotHTML("avaria","Foto da avaria","📸",WZ.fotos.avaria)}</div>
+      <label style="margin-top:14px">Fotos da avaria (pode adicionar várias)</label>
+      <div class="photo-grid" id="av-fotos">${avariaFotosHTML()}</div>
     </div>
     ${wzNav()}`;
-  bindPhoto("avaria");
+}
+/* monta o grid de fotos da avaria + o botão de adicionar */
+function avariaFotosHTML(){
+  WZ.avaria.fotos = WZ.avaria.fotos || [];
+  const slots = WZ.avaria.fotos.map((foto,i)=>`
+    <div class="photo-slot done">
+      <img src="${foto}"><button class="rm" onclick="event.stopPropagation();removeAvariaFoto(${i})">✕</button>
+      <span class="badge">✓ Foto ${i+1}</span>
+    </div>`).join("");
+  const add=`<div class="photo-slot" onclick="addAvariaFoto()">
+      <span class="em">➕</span><span>Adicionar foto</span>
+      <span style="font-size:11px;color:var(--muted2)">Toque para abrir a câmera</span></div>`;
+  return slots+add;
+}
+/* abre a câmera; ao capturar, empurra no array e re-renderiza o grid */
+function addAvariaFoto(){
+  const key="avaria_add";
+  registrarFoto(key,(dataUrl)=>{
+    WZ.avaria.fotos = WZ.avaria.fotos || [];
+    WZ.avaria.fotos.push(dataUrl);
+    wzSave();
+    const grid=$("#av-fotos"); if(grid) grid.innerHTML=avariaFotosHTML();
+  });
+  triggerPhoto(key);
+}
+function removeAvariaFoto(i){
+  WZ.avaria.fotos.splice(i,1); wzSave();
+  const grid=$("#av-fotos"); if(grid) grid.innerHTML=avariaFotosHTML();
 }
 function setAvaria(v){WZ.avaria.tem=v;wzSave();stAvarias($("#wz-body"));}
 function toggleArea(a){const i=WZ.avaria.areas.indexOf(a);if(i<0)WZ.avaria.areas.push(a);else WZ.avaria.areas.splice(i,1);wzSave();stAvarias($("#wz-body"));}
@@ -1812,8 +1863,8 @@ function validateRetirada(){
   const chkPbSemDesc=CHECKLIST_ITENS.some((_,i)=>WZ.checklist[i]&&WZ.checklist[i].v==="pb"&&!WZ.checklist[i].desc);
   if(chkPbSemDesc)p.push("Descreva os problemas do checklist");
   if(!WZ.niveisAgua||!WZ.niveisOleo)p.push("Informe níveis de água e óleo");
-  const fotoFalta=FOTOS_ITENS.some(([k])=>!WZ.fotos[k]);
-  if(fotoFalta)p.push("Tire todas as fotos obrigatórias");
+  const fotoFalta=FOTOS_OBRIGATORIAS.some(k=>!WZ.fotos[k]);
+  if(fotoFalta)p.push("Tire as fotos obrigatórias (frente, traseira, laterais e painel)");
   if(WZ.avaria.tem&&!WZ.avaria.desc)p.push("Descreva a avaria");
   if(!WZ.termo)p.push("Aceite o termo de responsabilidade");
   return p;
@@ -1826,8 +1877,15 @@ async function finalizarRetirada(){
   const fotoRefs={};
   let soLocal=0, totalFotos=0;
   const guarda=async(key,dataUrl)=>{ totalFotos++; const ref=await photoPut(key,dataUrl); if(!/^https?:\/\//.test(ref)) soLocal++; return ref; };
-  for(const [k] of FOTOS_ITENS){ if(WZ.fotos[k]){const key=rid+"_ret_"+k;fotoRefs[k]=await guarda(key,WZ.fotos[k]);} }
-  if(WZ.fotos.avaria){const key=rid+"_ret_avaria";fotoRefs.avaria=await guarda(key,WZ.fotos.avaria);}
+  for(const [k] of FOTOS_RET){ if(WZ.fotos[k]){const key=rid+"_ret_"+k;fotoRefs[k]=await guarda(key,WZ.fotos[k]);} }
+  // fotos da avaria (várias)
+  const avariaRefs=[];
+  if(WZ.avaria && WZ.avaria.fotos && WZ.avaria.fotos.length){
+    for(let i=0;i<WZ.avaria.fotos.length;i++){
+      const key=rid+"_ret_avaria"+i;
+      avariaRefs.push(await guarda(key,WZ.avaria.fotos[i]));
+    }
+  }
   const chk={};
   for(const i in WZ.checklist){ const c={...WZ.checklist[i]}; if(c.foto){const key=rid+"_ret_chk"+i;c.foto=await guarda(key,c.foto);} chk[i]=c; }
   if(apiConfigurada() && soLocal>0){
@@ -1837,7 +1895,7 @@ async function finalizarRetirada(){
   const reg={id:rid,veiculoId:WZ.veiculoId,motoristaId:WZ.motoristaId,
     destinoId:WZ.destinoId,destinoNome:WZ.destinoNome,finalidade:WZ.finalidade,
     kmInicial:+WZ.kmInicial,nivelComb:WZ.nivelComb,niveisAgua:WZ.niveisAgua,niveisOleo:WZ.niveisOleo,
-    checklist:chk,fotos:fotoRefs,avaria:WZ.avaria,
+    checklist:chk,fotos:fotoRefs,avaria:{...WZ.avaria,fotosRefs:avariaRefs},
     lat:WZ.lat,lng:WZ.lng,data:nowISO(),
     termoAceite:{nome:motorista(WZ.motoristaId)?.nome,data:nowISO(),usuario:SESSION.nome},
     devolvida:false};
@@ -1847,7 +1905,7 @@ async function finalizarRetirada(){
   // registra ocorrência de avaria se houver
   if(WZ.avaria.tem){
     DB.ocorrencias.push({id:uid("o"),veiculoId:v.id,motoristaId:WZ.motoristaId,tipo:"Avaria",
-      data:nowISO(),local:WZ.destinoNome,descricao:WZ.avaria.desc+" | Áreas: "+WZ.avaria.areas.join(", "),status:"Aberta",fotos:fotoRefs.avaria?[fotoRefs.avaria]:[]});
+      data:nowISO(),local:WZ.destinoNome,descricao:WZ.avaria.desc+" | Áreas: "+WZ.avaria.areas.join(", "),status:"Aberta",fotos:avariaRefs});
   }
   log("Retirou viatura",v.interno);
   saveSync(["retiradas","veiculos","ocorrencias","auditoria"]); wzClear();
@@ -2057,9 +2115,9 @@ function dvChecklist(b){
   CHECKLIST_ITENS.forEach((it,i)=>bindChkPhoto(i));
 }
 function dvFotos(b){
-  b.innerHTML=`<h3>Fotos da devolução</h3><p class="desc">Registre novamente o veículo.</p>
-    <div class="photo-grid">${FOTOS_ITENS.map(([k,l,e])=>photoSlotHTML(k,l,e,WZ.fotos[k])).join("")}</div>${dvNav()}`;
-  FOTOS_ITENS.forEach(([k])=>bindPhoto(k));
+  b.innerHTML=`<h3>Fotos da devolução</h3><p class="desc">Registre novamente o veículo. Não é preciso foto de água/óleo (motor quente).</p>
+    <div class="photo-grid">${FOTOS_DEV.map(([k,l,e])=>photoSlotHTML(k,l,e,WZ.fotos[k])).join("")}</div>${dvNav()}`;
+  FOTOS_DEV.forEach(([k])=>bindPhoto(k));
 }
 function dvOcc(b){
   const tipos=["Acidente","Avaria","Pane","Multa","Problema mecânico","Falta de combustível","Problema operacional","Outro"];
@@ -2084,10 +2142,10 @@ function dvFinal(b){
   const r=DB.retiradas.find(x=>x.id===WZ.retiradaId),v=veiculo(WZ.veiculoId);
   const perc=(+WZ.kmFinal)-r.kmInicial;
   const chkVazio=CHECKLIST_ITENS.some((_,i)=>!WZ.checklist[i]||!WZ.checklist[i].v);
-  const fotoFalta=FOTOS_ITENS.some(([k])=>!WZ.fotos[k]);
+  const fotoFalta=FOTOS_OBRIGATORIAS.some(k=>!WZ.fotos[k]);
   const probs=[];
   if(chkVazio)probs.push("Complete o checklist");
-  if(fotoFalta)probs.push("Tire todas as fotos");
+  if(fotoFalta)probs.push("Tire as fotos obrigatórias (frente, traseira, laterais e painel)");
   if(!WZ.termo)probs.push("Aceite o termo");
   b.innerHTML=`<h3>Finalizar devolução</h3>
     <div class="rec-lines">
@@ -2107,7 +2165,7 @@ async function finalizarDevolucao(){
   const fotoRefs={};
   let soLocal=0, totalFotos=0;
   const guarda=async(key,dataUrl)=>{ totalFotos++; const ref=await photoPut(key,dataUrl); if(!/^https?:\/\//.test(ref)) soLocal++; return ref; };
-  for(const [k] of FOTOS_ITENS){if(WZ.fotos[k]){const key=did+"_dev_"+k;fotoRefs[k]=await guarda(key,WZ.fotos[k]);}}
+  for(const [k] of FOTOS_DEV){if(WZ.fotos[k]){const key=did+"_dev_"+k;fotoRefs[k]=await guarda(key,WZ.fotos[k]);}}
   const chk={};
   for(const i in WZ.checklist){const c={...WZ.checklist[i]};if(c.foto){const key=did+"_dev_chk"+i;c.foto=await guarda(key,c.foto);}chk[i]=c;}
   const perc=(+WZ.kmFinal)-r.kmInicial;
