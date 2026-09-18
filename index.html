@@ -1098,7 +1098,9 @@ ROUTES.dashboard=(el)=>{
   const uso=DB.veiculos.filter(v=>v.status==="Em uso").length;
   const man=DB.veiculos.filter(v=>v.status==="Manutenção").length;
   const motAtivos=DB.motoristas.filter(m=>m.status==="Ativo").length;
-  const gastoComb=DB.abastecimentos.filter(a=>isThisMonth(a.data)).reduce((s,a)=>s+(+a.total||0),0);
+  const abMes=DB.abastecimentos.filter(a=>isThisMonth(a.data));
+  const gastoComb=abMes.filter(a=>a.tipo!=="gerador").reduce((s,a)=>s+(+a.total||0),0);
+  const gastoGer=abMes.filter(a=>a.tipo==="gerador").reduce((s,a)=>s+(+a.total||0),0);
   const kmMes=DB.devolucoes.filter(d=>isThisMonth(d.data)).reduce((s,d)=>s+(+d.kmPercorrido||0),0);
   const occAbertas=DB.ocorrencias.filter(o=>o.status!=="Resolvida").length;
 
@@ -1112,6 +1114,7 @@ ROUTES.dashboard=(el)=>{
       ${stat("👨‍✈️","Motoristas ativos",motAtivos,"")}
       ${stat("⛽","Combustível no mês",fmtMoney(gastoComb),"gold")}
       ${stat("🛣️","KM no mês",fmtKm(kmMes),"blue")}
+      ${stat("🔌","Gerador no mês",fmtMoney(gastoGer),"orange")}
       ${stat("⚠️","Ocorrências abertas",occAbertas,"red")}
     </div>
 
@@ -1267,7 +1270,7 @@ function setStatus(id,st){
 function renderTimeline(box,vid){
   const ev=[];
   DB.retiradas.filter(r=>r.veiculoId===vid).forEach(r=>ev.push({d:r.data,em:"🚗",t:"Retirada",s:`${motorista(r.motoristaId)?.nome||"—"} · KM ${fmtNum(r.kmInicial)} · ${esc(r.destinoNome)}`, fotoBtn:`ret:${r.id}`}));
-  DB.devolucoes.filter(x=>x.veiculoId===vid).forEach(x=>ev.push({d:x.data,em:"🔄",t:"Devolução",s:`KM ${fmtNum(x.kmFinal)} · percorrido ${fmtNum(x.kmPercorrido)} km`, fotoBtn:`dev:${x.id}`}));
+  DB.devolucoes.filter(x=>x.veiculoId===vid).forEach(x=>ev.push({d:x.data,em:"🔄",t:x.automatica?"Devolução automática":"Devolução",s:`KM ${fmtNum(x.kmFinal)} · percorrido ${fmtNum(x.kmPercorrido)} km${x.automatica?" · gerada na nova retirada":""}`, fotoBtn:`dev:${x.id}`}));
   DB.abastecimentos.filter(a=>a.veiculoId===vid).forEach(a=>ev.push({d:a.data,em:"⛽",t:"Abastecimento",s:`${a.litros} ${unidadeAbast(a)} · ${fmtMoney(a.total)}`, fotoBtn: a.cupom?`ab:${a.id}`:null}));
   DB.manutencoes.filter(m=>m.veiculoId===vid).forEach(m=>ev.push({d:m.data,em:"🔧",t:"Manutenção — "+esc(m.tipo),s:`${esc(m.descricao||"")} · ${fmtMoney(m.valor)}`}));
   DB.ocorrencias.filter(o=>o.veiculoId===vid).forEach(o=>ev.push({d:o.data,em:"⚠️",t:"Ocorrência — "+esc(o.tipo),s:esc(o.descricao||"")}));
@@ -1667,17 +1670,69 @@ function stMotorista(b){
 }
 function pickMot(id){ WZ.motoristaId=id;wzSave();stMotorista($("#wz-body")); }
 
-/* etapa 2 - veículo (só disponíveis) */
+/* etapa 2 - veículo (TODOS aparecem, inclusive os não devolvidos) */
 function stVeiculo(b){
-  const list=DB.veiculos.filter(v=>v.status==="Disponível");
-  b.innerHTML=`<h3>Qual viatura?</h3><p class="desc">Somente veículos disponíveis são exibidos.</p>
-    ${list.length?`<div class="pick">${list.map(v=>`<div class="opt ${WZ.veiculoId===v.id?"sel":""}" onclick="pickVeic('${v.id}')">
+  const ordem={"Disponível":0,"Em uso":1,"Manutenção":2,"Indisponível":3};
+  const list=DB.veiculos.slice().sort((a,b2)=>
+    ((ordem[a.status]??9)-(ordem[b2.status]??9)) || (a.interno||"").localeCompare(b2.interno||"","pt-BR"));
+  b.innerHTML=`<h3>Qual viatura?</h3><p class="desc">Todas as viaturas aparecem. Se estiver com retirada aberta, a devolução é registrada automaticamente ao selecionar.</p>
+    ${list.length?`<div class="pick">${list.map(v=>{
+      const ab=retiradaAberta(v.id);
+      const m=ab?motorista(ab.motoristaId):null;
+      const sub = ab
+        ? `🔴 NÃO DEVOLVIDO — ${esc(m?.nome||"motorista")} · saída ${dtBR(ab.data)}`
+        : `${esc([v.marca,v.modelo].filter(Boolean).join(" ")||v.tipo)} · ${fmtKm(v.km)}`;
+      const alerta = (!ab && (v.status==="Manutenção"||v.status==="Indisponível")) ? ` · ${esc(v.status)}` : "";
+      return `<div class="opt ${WZ.veiculoId===v.id?"sel":""}" onclick="pickVeic('${v.id}')">
       <div class="av">${v.tipo==="Moto"?"🏍️":v.interno.replace("V-","")}</div>
-      <div class="info"><div class="t">${esc(v.interno)} · ${esc(v.placa)}</div><div class="s">${esc([v.marca,v.modelo].filter(Boolean).join(" ")||v.tipo)} · ${fmtKm(v.km)}</div></div><div class="chk"></div></div>`).join("")}</div>`
-      :'<div class="empty"><div class="em">🚗</div>Nenhum veículo disponível</div>'}
+      <div class="info"><div class="t">${esc(v.interno)} · ${esc(v.placa)}${alerta}</div>
+      <div class="s" ${ab?'style="color:var(--red);font-weight:700"':''}>${sub}</div></div><div class="chk"></div></div>`;
+    }).join("")}</div>`
+      :'<div class="empty"><div class="em">🚗</div>Nenhum veículo cadastrado</div>'}
     ${wzNav()}`;
 }
-function pickVeic(id){ WZ.veiculoId=id; const v=veiculo(id); if(!WZ.kmInicial)WZ.kmInicial=v.km||""; wzSave();stVeiculo($("#wz-body")); }
+
+/* Fecha as retiradas abertas do veículo gerando uma devolução automática
+   (sem checklist/fotos, marcada automatica:true para auditoria). */
+function devolverAutomatico(vid){
+  const v=veiculo(vid);
+  const abertas=DB.retiradas.filter(r=>r.veiculoId===vid && !r.devolvida)
+                            .sort((a,b)=>new Date(a.data)-new Date(b.data));
+  if(!abertas.length){ if(v && v.status==="Em uso"){ v.status="Disponível"; saveSync(["veiculos"]); } return 0; }
+  const base=abertas[abertas.length-1];
+  const did=uid("dev");
+  const kmFinal=Math.max(+((v||{}).km)||0, +base.kmInicial||0);
+  DB.devolucoes.push({id:did,retiradaId:base.id,veiculoId:vid,motoristaId:base.motoristaId,
+    kmFinal,kmPercorrido:Math.max(0,kmFinal-(+base.kmInicial||0)),
+    checklist:{},fotos:{},ocorrencia:{tem:false,tipo:"",desc:""},
+    automatica:true,data:nowISO(),
+    termo:{data:nowISO(),usuario:SESSION.nome,
+      observacao:"Devolução automática gerada na nova retirada — o registro anterior ficou sem devolução"}});
+  abertas.forEach(r=>{ r.devolvida=true; if(!r.devolucaoId) r.devolucaoId=did; });
+  if(v){ v.status="Disponível"; v.km=kmFinal; }
+  log("Devolução automática",((v||{}).interno||vid)+" — "+abertas.length+" retirada(s) aberta(s) encerrada(s)");
+  saveSync(["devolucoes","retiradas","veiculos","auditoria"]);
+  return abertas.length;
+}
+
+function pickVeic(id){
+  const v=veiculo(id); if(!v) return;
+  const ab=retiradaAberta(id);
+  if(ab){
+    const m=motorista(ab.motoristaId);
+    if(!confirm(v.interno+" está com retirada aberta"+((m&&m.nome)?" ("+m.nome+")":"")+" desde "+dtBR(ab.data)+
+                ".\n\nRegistrar a devolução automática agora e seguir com a nova retirada?")) return;
+    devolverAutomatico(id);
+    toast("Devolução automática registrada — "+v.interno+" liberado");
+  } else if(v.status==="Manutenção"||v.status==="Indisponível"){
+    if(!confirm(v.interno+' está marcado como "'+v.status+'".\nRetirar mesmo assim?')) return;
+    v.status="Disponível"; saveSync(["veiculos"]);
+  }
+  const trocou = WZ.veiculoId!==id;
+  WZ.veiculoId=id;
+  if(trocou || !WZ.kmInicial) WZ.kmInicial=v.km||"";
+  wzSave(); stVeiculo($("#wz-body"));
+}
 
 /* etapa 3 - destino (entrada manual) */
 function stDestino(b){
@@ -1872,7 +1927,12 @@ function validateRetirada(){
 
 async function finalizarRetirada(){
   const v=veiculo(WZ.veiculoId);
-  if(v.status!=="Disponível"){toast("Veículo não está mais disponível");return;}
+  if(!v){toast("Veículo não encontrado");return;}
+  // rede de segurança: se ainda restou retirada aberta, fecha automaticamente
+  if(DB.retiradas.some(r=>r.veiculoId===v.id && !r.devolvida)) devolverAutomatico(v.id);
+  if(v.status==="Manutenção"||v.status==="Indisponível"){
+    toast("Veículo em "+v.status+" — ajuste o status antes de retirar"); return;
+  }
   const rid=uid("r");
   const fotoRefs={};
   let soLocal=0, totalFotos=0;
@@ -2210,51 +2270,100 @@ async function finalizarDevolucao(){
 ROUTES["mot-abast"]=ROUTES.abastecimentos=(el)=>{
   const isAdmin=SESSION.tipo!=="motorista";
   el.innerHTML=`<div class="wrap"><h2 class="page-title">⛽ Abastecimentos</h2>
-    <button class="btn" style="margin-bottom:14px" onclick="formAbastecimento()">＋ Registrar abastecimento</button>
+    <button class="btn" style="margin-bottom:14px" onclick="formAbastecimento('veiculo')">＋ ⛽ Abastecer veículo</button>
+    <button class="btn sec" style="margin-bottom:14px" onclick="formAbastecimento('gerador')">＋ 🔌 Abastecer gerador</button>
     <div class="list" id="ab-list"></div></div>`;
   let arr=DB.abastecimentos.slice().reverse();
   if(!isAdmin) arr=arr.filter(a=>a.motoristaId===SESSION.id);
   $("#ab-list").innerHTML=arr.length?arr.map(a=>{
+    const ehGer = a.tipo==="gerador";
     const v=veiculo(a.veiculoId);
     const m=motorista(a.motoristaId);
-    const placa = v?.placa ? " · "+esc(v.placa) : "";
+    const placa = (!ehGer && v && v.placa) ? " · "+esc(v.placa) : "";
     const comb = a.combustivel ? esc(a.combustivel) : "—";
-    return `<div class="row-item"><div class="av">⛽</div>
+    const titulo = ehGer
+      ? "🔌 "+esc(a.gerador||"—")+(a.local?" · "+esc(a.local):"")
+      : esc((v&&v.interno)||"—")+placa;
+    return `<div class="row-item"><div class="av">${ehGer?"🔌":"⛽"}</div>
       <div class="main">
-        <div class="t">${esc(v?.interno||"—")}${placa} · ${a.litros} ${unidadeAbast(a)}</div>
-        <div class="s">${comb} · ${esc(m?.nome||"Motorista não informado")}</div>
+        <div class="t">${titulo} · ${a.litros} ${unidadeAbast(a)}</div>
+        <div class="s">${comb} · ${esc((m&&m.nome)||"Responsável não informado")}</div>
         <div class="s">${dtBR(a.data)} · ${esc(a.posto||"")} · ${fmtMoney(a.total)}</div>
       </div>
-      <span class="tag gold">${a.tanqueCheio?"Tanque cheio":""}</span></div>`;
+      <span class="tag ${ehGer?"orange":"gold"}">${ehGer?"Gerador":(a.tanqueCheio?"Tanque cheio":"")}</span></div>`;
   }).join(""):'<div class="empty"><div class="em">⛽</div>Nenhum abastecimento</div>';
 };
-function formAbastecimento(){
+
+const COMB_VEICULO=["Gasolina","Etanol","Diesel","GNV"];
+const COMB_GERADOR=["Gasolina","Diesel"];
+
+function formAbastecimento(tipo){
+  tipo = (tipo==="gerador") ? "gerador" : "veiculo";
   const vs=DB.veiculos, ms=DB.motoristas.filter(m=>m.status==="Ativo");
   const motDefault=SESSION.tipo==="motorista"?SESSION.id:"";
+  const geradoresUsados=[...new Set(DB.abastecimentos.filter(a=>a.tipo==="gerador"&&a.gerador).map(a=>a.gerador))];
   openModal("Registrar abastecimento",`
-    <label>Veículo</label><select id="ab-veic"><option value="">Selecione</option>${vs.map(v=>`<option value="${v.id}">${esc(v.interno)} · ${esc(v.placa)}</option>`).join("")}</select>
-    <label>Motorista</label><select id="ab-mot"><option value="">Selecione</option>${ms.map(m=>`<option value="${m.id}" ${m.id===motDefault?"selected":""}>${esc(m.nome)}</option>`).join("")}</select>
-    <div class="two"><div><label>Data</label><input id="ab-data" type="datetime-local" value="${new Date().toISOString().slice(0,16)}"></div>
-      <div><label>KM</label><input id="ab-km" type="number" inputmode="numeric"></div></div>
+    <label>O que foi abastecido?</label>
+    <div class="fuel-row" style="max-width:280px">
+      <button type="button" id="ab-tp-veic" onclick="setAbastTipo('veiculo')">🚗 Veículo</button>
+      <button type="button" id="ab-tp-ger" onclick="setAbastTipo('gerador')">🔌 Gerador</button>
+    </div>
+
+    <div id="ab-box-veic" style="margin-top:10px">
+      <label>Veículo</label><select id="ab-veic"><option value="">Selecione</option>${vs.map(v=>`<option value="${v.id}">${esc(v.interno)} · ${esc(v.placa)}</option>`).join("")}</select>
+      <label>KM</label><input id="ab-km" type="number" inputmode="numeric">
+    </div>
+
+    <div id="ab-box-ger" style="margin-top:10px;display:none">
+      <label>Gerador / equipamento</label>
+      <input id="ab-ger" list="ab-ger-opts" placeholder="Ex.: Gerador Base Volta Redonda">
+      <datalist id="ab-ger-opts">${geradoresUsados.map(g=>`<option value="${esc(g)}">`).join("")}</datalist>
+      <label>Local / base</label><input id="ab-local" placeholder="Ex.: Volta Redonda">
+      <div class="hint">Use para compra de combustível de gerador a gasolina ou diesel (não entra no custo por km da frota).</div>
+    </div>
+
+    <label>Responsável</label><select id="ab-mot"><option value="">Selecione</option>${ms.map(m=>`<option value="${m.id}" ${m.id===motDefault?"selected":""}>${esc(m.nome)}</option>`).join("")}</select>
+    <label>Data</label><input id="ab-data" type="datetime-local" value="${new Date().toISOString().slice(0,16)}">
     <label>Posto</label><input id="ab-posto">
-    <label>Combustível</label><select id="ab-comb" onchange="ajustaUnidadeComb()">${["Gasolina","Etanol","Diesel","GNV"].map(o=>`<option>${o}</option>`).join("")}</select>
+    <label>Combustível</label><select id="ab-comb" onchange="ajustaUnidadeComb()"></select>
     <div class="two"><div><label id="ab-lbl-qtd">Litros</label><input id="ab-litros" type="number" step="0.01" inputmode="decimal" oninput="calcAbast()"></div>
       <div><label id="ab-lbl-vl">Valor por litro (R$)</label><input id="ab-vl" type="number" step="0.01" inputmode="decimal" oninput="calcAbast()"></div></div>
     <div class="rec-lines" style="margin:12px 0 4px"><div class="rl"><span>Total</span><b id="ab-total">R$ 0,00</b></div></div>
-    <label>Tanque cheio?</label><div class="fuel-row" style="max-width:200px"><button type="button" class="on" id="ab-tc-sim" onclick="setTanque(true)">Sim</button><button type="button" id="ab-tc-nao" onclick="setTanque(false)">Não</button></div>
+    <div id="ab-box-tanque"><label>Tanque cheio?</label><div class="fuel-row" style="max-width:200px"><button type="button" class="on" id="ab-tc-sim" onclick="setTanque(true)">Sim</button><button type="button" id="ab-tc-nao" onclick="setTanque(false)">Não</button></div></div>
     <label style="margin-top:12px">Foto do cupom</label>${photoSlotHTML("cupom","Cupom fiscal","🧾")}
     <div class="wizard-nav"><button class="btn sec" onclick="closeModal()">Cancelar</button>
       <button class="btn" onclick="salvarComBotao(this, saveAbastecimento)">Salvar</button></div>`);
   window._tanque=true;
   bindPhotoKey("cupom",u=>{window._cupom=u;});
+  setAbastTipo(tipo);
+}
+
+function setAbastTipo(t){
+  const isG = t==="gerador";
+  window._abTipo = isG?"gerador":"veiculo";
+  const bv=$("#ab-tp-veic"), bg=$("#ab-tp-ger");
+  if(bv) bv.classList.toggle("on",!isG);
+  if(bg) bg.classList.toggle("on",isG);
+  const boxV=$("#ab-box-veic"), boxG=$("#ab-box-ger"), boxT=$("#ab-box-tanque");
+  if(boxV) boxV.style.display = isG?"none":"";
+  if(boxG) boxG.style.display = isG?"":"none";
+  if(boxT) boxT.style.display = isG?"none":"";
+  const sel=$("#ab-comb");
+  if(sel){
+    const atual=sel.value;
+    const opts=isG?COMB_GERADOR:COMB_VEICULO;
+    sel.innerHTML=opts.map(o=>`<option ${o===atual?"selected":""}>${o}</option>`).join("");
+    if(opts.indexOf(atual)<0) sel.value=opts[0];
+  }
   ajustaUnidadeComb();
 }
+
 /* GNV é medido em metro cúbico (m³); os demais em litro (L). */
 function unidadeComb(comb){ return comb==="GNV" ? "m³" : "L"; }
 /* Unidade de um abastecimento já registrado (registros antigos = L). */
 function unidadeAbast(a){ return a.unidade || unidadeComb(a.combustivel); }
 function ajustaUnidadeComb(){
-  const comb=$("#ab-comb")?.value||"";
+  const comb=($("#ab-comb")||{}).value||"";
   const u=unidadeComb(comb);
   const lq=$("#ab-lbl-qtd"), lv=$("#ab-lbl-vl");
   if(lq) lq.textContent = u==="m³" ? "Metros cúbicos (m³)" : "Litros";
@@ -2262,10 +2371,13 @@ function ajustaUnidadeComb(){
 }
 function setTanque(v){window._tanque=v;$("#ab-tc-sim").classList.toggle("on",v);$("#ab-tc-nao").classList.toggle("on",!v);}
 function calcAbast(){const l=+$("#ab-litros").value||0,vl=+$("#ab-vl").value||0;$("#ab-total").textContent=fmtMoney(l*vl);}
+
 async function saveAbastecimento(){
-  const g=k=>$("#ab-"+k).value;
-  if(!g("veic")){toast("Selecione o veículo");return;}
-  const litros=+g("litros")||0,vl=+g("vl")||0;
+  const g=k=>{const e=$("#ab-"+k); return e?e.value:"";};
+  const tipo=window._abTipo||"veiculo";
+  if(tipo==="veiculo" && !g("veic")){toast("Selecione o veículo");return;}
+  if(tipo==="gerador" && !g("ger").trim()){toast("Identifique o gerador");return;}
+  const litros=+g("litros")||0, vl=+g("vl")||0;
   const unidade=unidadeComb(g("comb"));
   if(!litros){toast("Informe a quantidade ("+unidade+")");return;}
   const id=uid("ab"); let cupomRef=null;
@@ -2273,12 +2385,23 @@ async function saveAbastecimento(){
   if(apiConfigurada() && window._cupom && cupomRef && !/^https?:\/\//.test(cupomRef)){
     toast("⚠ A foto do cupom não subiu à nuvem — ficou no aparelho");
   }
-  DB.abastecimentos.push({id,veiculoId:g("veic"),motoristaId:g("mot"),
-    data:g("data")?new Date(g("data")).toISOString():nowISO(),km:+g("km")||0,posto:g("posto"),
-    combustivel:g("comb"),litros,unidade,valorLitro:vl,total:litros*vl,tanqueCheio:window._tanque,cupom:cupomRef});
-  const v=veiculo(g("veic")); if(g("km")&&+g("km")>v.km)v.km=+g("km");
-  log("Registrou abastecimento",v.interno+" "+litros+unidade);
-  window._cupom=null;saveSync(["abastecimentos"]);closeModal();toast("Abastecimento registrado");
+  const reg={id,tipo,
+    veiculoId: tipo==="veiculo"?g("veic"):"",
+    gerador:   tipo==="gerador"?g("ger").trim():"",
+    local:     tipo==="gerador"?g("local").trim():"",
+    motoristaId:g("mot"),
+    data:g("data")?new Date(g("data")).toISOString():nowISO(),
+    km: tipo==="veiculo"?(+g("km")||0):0,
+    posto:g("posto"),combustivel:g("comb"),litros,unidade,valorLitro:vl,total:litros*vl,
+    tanqueCheio: tipo==="veiculo"?window._tanque:false,cupom:cupomRef};
+  DB.abastecimentos.push(reg);
+  let alvo="Gerador "+reg.gerador, abas=["abastecimentos"];
+  if(tipo==="veiculo"){
+    const v=veiculo(g("veic"));
+    if(v){ if(g("km")&&+g("km")>v.km) v.km=+g("km"); alvo=v.interno; abas=["abastecimentos","veiculos"]; }
+  }
+  log("Registrou abastecimento",alvo+" "+litros+unidade);
+  window._cupom=null;saveSync(abas);closeModal();toast("Abastecimento registrado");
   go(SESSION.tipo==="motorista"?"mot-abast":"abastecimentos");
 }
 
@@ -2580,10 +2703,12 @@ function gerarRelatorio(tipo){
       const v=veiculo(r.veiculoId),m=motorista(r.motoristaId),dev=DB.devolucoes.find(d=>d.id===r.devolucaoId);
       rows.push([dtBR(r.data),v?.interno||"",m?.nome||"",r.destinoNome,r.kmInicial,dev?.kmFinal||"",dev?.kmPercorrido||"",r.devolvida?"Devolvido":"Em uso"]);});
   } else if(tipo==="abastecimento"){
-    title="Relatório de Abastecimento";head=["Data","Veículo","Motorista","Posto","Combustível","Qtd.","Unid.","R$/un.","Total"];
+    title="Relatório de Abastecimento";head=["Data","Tipo","Veículo/Gerador","Responsável","Posto","Combustível","Qtd.","Unid.","R$/un.","Total"];
     DB.abastecimentos.filter(a=>f.test(a.data,a.veiculoId,a.motoristaId)).forEach(a=>{
+      const ehGer=a.tipo==="gerador";
       const v=veiculo(a.veiculoId),m=motorista(a.motoristaId);
-      rows.push([dtBR(a.data),v?.interno||"",m?.nome||"",a.posto,a.combustivel||"",a.litros,unidadeAbast(a),a.valorLitro,a.total]);});
+      const alvo=ehGer?((a.gerador||"")+(a.local?" ("+a.local+")":"")):(v?.interno||"");
+      rows.push([dtBR(a.data),ehGer?"Gerador":"Veículo",alvo,m?.nome||"",a.posto,a.combustivel||"",a.litros,unidadeAbast(a),a.valorLitro,a.total]);});
   } else if(tipo==="gastos"){
     title="Relatório de Gastos";head=["Veículo","Combustível","Manutenção","Total","KM","Custo/km"];
     DB.veiculos.filter(v=>!f.vid||v.id===f.vid).forEach(v=>{const s=veiculoStats(v.id);
