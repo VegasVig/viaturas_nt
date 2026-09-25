@@ -130,6 +130,10 @@ tr:last-child td{border-bottom:0}
 .big-btn.ret{background:linear-gradient(150deg,#4b8ef8,#2a5fc0)}
 .big-btn.fuel{background:linear-gradient(150deg,#e0a13a,#c07d1e);color:#1a1405}
 .big-btn.occ{background:linear-gradient(150deg,#e5484d,#b83236)}
+.big-btn.calib{background:linear-gradient(150deg,#2bb3a8,#1b7d75);grid-column:1/-1}
+/* veículo com calibragem atrasada: destaque na lista */
+.row-item.calib-atrasada,.opt.calib-atrasada{border-color:rgba(229,72,77,.55)!important;box-shadow:inset 3px 0 0 var(--red)}
+.calib-alert .btn{flex-shrink:0}
 
 /* ---------- WIZARD ---------- */
 .wizard-head{position:sticky;top:56px;z-index:30;background:rgba(11,15,26,.96);backdrop-filter:blur(8px);padding:12px 16px;border-bottom:1px solid var(--line)}
@@ -399,7 +403,32 @@ const SEED_USUARIOS = [
    central, sem precisar colar a URL manualmente. Se um dia mudar a
    implantação, basta trocar a URL abaixo. */
 const API_URL_PADRAO = "https://script.google.com/macros/s/AKfycbxPiQvEQjUxWjZ1mYrALKAOxHUbFUAFe2QFKqsuB67olUvMLHXUCwpstOHF5yQ6bSmR/exec";   // Niterói: cole aqui a URL do Apps Script (termina em /exec) ou configure pela tela da nuvem
-const API_KEY_STORE = "vegasfrota_api_url";
+/* ===== ARMAZENAMENTO PRÓPRIO DA FILIAL NITERÓI =====
+   A matriz (Volta Redonda) usa as chaves "vegasfrota_*". Se os dois apps
+   estiverem no mesmo endereço (ex.: mesmo GitHub Pages), o navegador
+   compartilharia esses dados e uma filial podia enxergar — ou enviar para a
+   planilha — dados da outra. Aqui a filial usa chaves próprias "vegasnit_*".
+   Na primeira abertura, os dados antigos são trazidos SOMENTE se forem
+   comprovadamente de Niterói (URL da planilha de Niterói ou placas/motoristas
+   da filial), e então removidos das chaves antigas. */
+(function migrarArmazenamentoNiteroi(){
+  try{
+    if(localStorage.getItem("vegasnit_db_v1")) return;          // já migrado
+    const dbVelho=localStorage.getItem("vegasfrota_db_v1");
+    const urlVelha=localStorage.getItem("vegasfrota_api_url")||"";
+    if(!dbVelho && !urlVelha) return;
+    const txt=(dbVelho||"")+" "+urlVelha;
+    const deNiteroi=/AKfycbxPiQvEQjUxWjZ1mYrALKAOxHUbFUAFe2QFKqsuB67olUvMLHXUCwpstOHF5yQ6bSmR|GKG0C57|RFD3B47|Antonio Carlos|Jhonatan Pessanha/.test(txt);
+    const deVR=/AKfycbw7Fven1E1nYcX1fdbxytGl8JAhAlQbueFzEPBvCRaLcXhUz45CmKsSSYHyUSLuYuCw|"placa":"FKD"|Adriano Dias|Genivaldo/.test(txt);
+    if(!deNiteroi || deVR) return;                               // não é (só) de Niterói: não mexe
+    ["db_v1","fila_sync","sync_hash","wizard_draft","api_url"].forEach(k=>{
+      const v=localStorage.getItem("vegasfrota_"+k);
+      if(v!=null){ localStorage.setItem("vegasnit_"+k, v); localStorage.removeItem("vegasfrota_"+k); }
+    });
+    console.info("Dados de Niterói migrados para armazenamento próprio.");
+  }catch(e){ console.warn("Migração de armazenamento:",e); }
+})();
+const API_KEY_STORE = "vegasnit_api_url";
 let API_URL = localStorage.getItem(API_KEY_STORE) || API_URL_PADRAO;
 
 function apiConfigurada(){ return !!API_URL; }
@@ -431,37 +460,95 @@ async function api(acao, payload){
   clearTimeout(t);
   const txt = await resp.text();
   let j; try{ j=JSON.parse(txt); }catch(e){ throw new Error("Resposta inválida do servidor"); }
-  if(!j.ok && j.erro) throw new Error(j.erro);
+  if(!j.ok && j.erro){ const er=new Error(j.erro); er.dados=j; throw er; }
   return j;
 }
+/* true quando o erro foi de rede (sem internet / tempo esgotado), e não uma
+   recusa do servidor (ex.: veículo já retirado). */
+function erroDeRede(e){ return !e || !e.dados; }
+/* Backend ainda na versão antiga (sem "retirar"/"devolver"): grava do jeito antigo
+   para não travar a operação enquanto o Apps Script não é reimplantado. */
+function backendAntigo(e){ return !!(e && /ação desconhecida/i.test(e.message||"")); }
 
 /* Testa a conexão (usado na tela de configuração). */
 async function apiPing(){ return api("ping"); }
 
-/* Baixa TODO o banco da planilha e substitui o DB local. */
-async function nuvemPull(){
-  const j = await api("pull");
-  if(j.db){
-    // preserva seeds locais caso a planilha esteja vazia (primeira vez)
-    const remoto=j.db;
-    DB = {
-      usuarios: remoto.usuarios?.length?remoto.usuarios:SEED_USUARIOS,
-      motoristas: remoto.motoristas?.length?remoto.motoristas:SEED_MOTORISTAS,
-      veiculos: remoto.veiculos?.length?remoto.veiculos:SEED_VEICULOS,
-      destinos: remoto.destinos?.length?remoto.destinos:SEED_DESTINOS,
-      retiradas: remoto.retiradas||[],
-      devolucoes: remoto.devolucoes||[],
-      abastecimentos: remoto.abastecimentos||[],
-      manutencoes: remoto.manutencoes||[],
-      ocorrencias: remoto.ocorrencias||[],
-      auditoria: remoto.auditoria||[],
-      _seq: remoto._seq||100
-    };
-    save(); // atualiza cache local
-    // se a planilha estava vazia, sobe os seeds iniciais
-    if(!remoto.motoristas?.length){ await nuvemSemear(); }
-  }
-  return DB;
+/* Todas as tabelas do banco (a ordem não importa). */
+const TABELAS=["usuarios","motoristas","veiculos","destinos","retiradas","devolucoes",
+  "abastecimentos","manutencoes","ocorrencias","calibragens","auditoria"];
+const TABELAS_SEED=()=>({usuarios:SEED_USUARIOS,motoristas:SEED_MOTORISTAS,veiculos:SEED_VEICULOS,destinos:SEED_DESTINOS});
+let ULTIMO_PULL=0;
+
+/* Baixa o banco da planilha e JUNTA com o que está no aparelho.
+   CORREÇÃO: antes, só as tabelas de movimento eram protegidas; qualquer
+   alteração local ainda não confirmada em VEÍCULOS (status e KM) era
+   substituída pela versão velha da planilha — por isso a quilometragem
+   "sumia" e veículos retirados voltavam a aparecer como disponíveis.
+   Agora nenhum registro local pendente é descartado, em nenhuma tabela. */
+let PULL_PROMISE=null;
+function nuvemPull(){
+  if(PULL_PROMISE) return PULL_PROMISE;          // evita dois pulls ao mesmo tempo
+  PULL_PROMISE=(async()=>{
+    try{ await filaSincronizar(); }catch(e){}
+    const hashes=syncHashes();
+    const pend={};
+    TABELAS.forEach(aba=>{
+      pend[aba]=(DB[aba]||[]).filter(r=>r && r.id!=null && hashes[aba]?.[r.id]!==hashReg(r));
+    });
+    const j=await api("pull");
+    if(!j.db) return DB;
+    const remoto=j.db, seeds=TABELAS_SEED();
+    const novo={}, novosHash={}, reenviar=new Set();
+    TABELAS.forEach(aba=>{
+      const rem=Array.isArray(remoto[aba])?remoto[aba].filter(r=>r&&r.id!=null):[];
+      novosHash[aba]={};
+      rem.forEach(r=>{ novosHash[aba][r.id]=hashReg(r); });
+      let arr=rem.slice();
+      // planilha vazia nas tabelas de cadastro: mantém o que o aparelho tem (ou os dados iniciais)
+      if(!arr.length && seeds[aba]){ arr=((DB[aba]&&DB[aba].length)?DB[aba]:seeds[aba]).slice(); }
+      const idx=new Map(arr.map((r,i)=>[String(r.id),i]));
+      (pend[aba]||[]).forEach(loc=>{
+        const i=idx.get(String(loc.id));
+        if(i==null){ arr.push(loc); idx.set(String(loc.id),arr.length-1); reenviar.add(aba); return; }
+        const r=arr[i];
+        if(aba==="retiradas"){
+          // retirada fechada em qualquer lugar continua fechada
+          if(r.devolvida && !loc.devolvida) return;
+          arr[i]=Object.assign({},r,loc,{devolvida:!!(r.devolvida||loc.devolvida),
+            devolucaoId:loc.devolucaoId||r.devolucaoId, devolvidaEm:loc.devolvidaEm||r.devolvidaEm});
+        } else if(aba==="veiculos"){
+          const m=Object.assign({},r,loc);
+          const correcaoLocal=loc.kmCorrigidoEm && loc.kmCorrigidoEm!==r.kmCorrigidoEm;
+          if(!correcaoLocal && (+r.km||0)>(+loc.km||0)){ m.km=r.km; m.kmEm=r.kmEm; }
+          arr[i]=m;
+        } else {
+          arr[i]=loc;                       // edição local ainda não enviada vence
+        }
+        reenviar.add(aba);
+      });
+      novo[aba]=arr;
+    });
+    novo._seq=Math.max(remoto._seq||100, DB._seq||100);
+    // auditoria: no aparelho ficam só os 1500 registros mais recentes (a planilha guarda tudo)
+    novo.auditoria.sort((a,b)=>String(b.data||"").localeCompare(String(a.data||"")));
+    if(novo.auditoria.length>1500) novo.auditoria=novo.auditoria.slice(0,1500);
+    DB=normalizarDB(novo);
+    localStorage.setItem(SYNC_HASH_KEY, JSON.stringify(novosHash));
+    save();
+    ULTIMO_PULL=Date.now();
+    reenviar.forEach(aba=>{ Promise.resolve(nuvemPushTabela(aba)).catch(()=>{}); });
+    if(!(remoto.motoristas||[]).length){ await nuvemSemear(); }
+    return DB;
+  })();
+  PULL_PROMISE.finally(()=>{ PULL_PROMISE=null; }).catch(()=>{});
+  return PULL_PROMISE;
+}
+/* Atualiza da nuvem antes de uma ação crítica. Se não houver internet,
+   segue com os dados do aparelho (e avisa). Retorna true se atualizou. */
+async function atualizarAntes(msg){
+  if(!apiConfigurada()) return false;
+  try{ if(msg) toast(msg); await nuvemPull(); return true; }
+  catch(e){ console.warn("Sem atualizar da nuvem:",e.message); toast("⚠ Sem conexão — usando os dados deste aparelho"); return false; }
 }
 
 /* Envia seeds iniciais para a planilha (primeira instalação). */
@@ -492,22 +579,31 @@ async function nuvemPush(aba, registro){
 }
 
 /* Fila de reenvio (quando estiver offline). */
-const FILA_KEY="vegasfrota_fila_sync";
+const FILA_KEY="vegasnit_fila_sync";
 function filaAdd(aba,registro){
   const f=JSON.parse(localStorage.getItem(FILA_KEY)||"[]");
   f.push({aba,registro,ts:Date.now()});
   localStorage.setItem(FILA_KEY,JSON.stringify(f));
 }
+let FILA_RODANDO=false;
 async function filaSincronizar(){
-  if(!API_URL) return;
+  if(!API_URL || FILA_RODANDO) return;
   let f=JSON.parse(localStorage.getItem(FILA_KEY)||"[]");
   if(!f.length) return;
+  FILA_RODANDO=true;
+  // mantém só a versão mais recente de cada registro
+  const mapa=new Map();
+  f.forEach(it=>{ if(it && it.registro) mapa.set(it.aba+"|"+it.registro.id, it); });
   const restantes=[];
-  for(const item of f){
-    try{ await api("push",{aba:item.aba,registro:item.registro}); }
-    catch(e){ restantes.push(item); }
-  }
-  localStorage.setItem(FILA_KEY,JSON.stringify(restantes));
+  try{
+    for(const item of mapa.values()){
+      try{ await api("push",{aba:item.aba,registro:limparRegistro(item.registro)}); marcarSync(item.aba,[item.registro]); }
+      catch(e){ restantes.push(item); }
+    }
+  } finally { FILA_RODANDO=false; }
+  // o que entrou na fila enquanto enviávamos também é preservado
+  const novosNaFila=JSON.parse(localStorage.getItem(FILA_KEY)||"[]").slice(f.length);
+  localStorage.setItem(FILA_KEY,JSON.stringify(restantes.concat(novosNaFila)));
   if(f.length && !restantes.length) toast("Dados pendentes sincronizados ✓");
 }
 
@@ -529,14 +625,76 @@ async function nuvemFoto(nome, dataUrl){
 }
 
 /* Sincroniza tabelas de movimento inteiras (usado após operações em lote). */
+/* ---- Controle do que já está confirmado na planilha ----
+   Guarda um "hash" de cada registro já gravado. Assim cada salvamento envia
+   SÓ o que mudou (antes reenviava a tabela inteira a cada ação, o que ficava
+   lento, estourava o tempo e falhava em silêncio). */
+const SYNC_HASH_KEY="vegasnit_sync_hash";
+function syncHashes(){ try{ return JSON.parse(localStorage.getItem(SYNC_HASH_KEY)||"{}"); }catch(e){ return {}; } }
+function hashReg(r){
+  const t=JSON.stringify(r); let h=0;
+  for(let i=0;i<t.length;i++){ h=((h<<5)-h+t.charCodeAt(i))|0; }
+  return h+":"+t.length;
+}
+function marcarSync(aba,regs){
+  const hs=syncHashes(); hs[aba]=hs[aba]||{};
+  regs.forEach(r=>{ if(r && r.id!=null) hs[aba][r.id]=hashReg(r); });
+  localStorage.setItem(SYNC_HASH_KEY, JSON.stringify(hs));
+}
+/* Remove fotos em base64 de dentro dos registros. A foto já foi salva no
+   Drive/aparelho e o registro guarda só a referência. Base64 dentro do
+   registro passava do limite de 50.000 caracteres por célula da planilha
+   e a retirada inteira era recusada. */
+function limparRegistro(r){
+  if(r && r.avaria && Array.isArray(r.avaria.fotos) && r.avaria.fotos.length){ delete r.avaria.fotos; }
+  return r;
+}
+const PUSH_EM_ANDAMENTO={};
 async function nuvemPushTabela(aba){
   if(!API_URL) return;
-  const dados=DB[aba]||[];
-  for(let i=0;i<dados.length;i+=40){
-    try{ await api("pushMuitos",{itens:dados.slice(i,i+40).map(r=>({aba,registro:r}))}); }
-    catch(e){ console.warn("push tabela falhou",aba,e.message); }
+  if(PUSH_EM_ANDAMENTO[aba]){ PUSH_EM_ANDAMENTO[aba].depois=true; return; }
+  PUSH_EM_ANDAMENTO[aba]={depois:false};
+  try{
+    const hs=syncHashes()[aba]||{};
+    const dados=(DB[aba]||[]).map(limparRegistro).filter(r=>r && r.id!=null && hs[r.id]!==hashReg(r));
+    for(let i=0;i<dados.length;i+=20){
+      const lote=dados.slice(i,i+20);
+      try{
+        await api("pushMuitos",{itens:lote.map(r=>({aba,registro:r}))});
+        marcarSync(aba,lote);
+      }catch(e){
+        console.warn("push tabela falhou",aba,e.message);
+        lote.forEach(r=>filaAdd(aba,r));   // não perde: tenta de novo depois
+      }
+    }
+  } finally {
+    const again=PUSH_EM_ANDAMENTO[aba].depois;
+    delete PUSH_EM_ANDAMENTO[aba];
+    if(again) nuvemPushTabela(aba);
   }
 }
+// tenta reenviar pendências periodicamente e quando a internet volta
+setInterval(()=>{ if(apiConfigurada()) filaSincronizar().catch(()=>{}); }, 60000);
+window.addEventListener("online",()=>{ if(apiConfigurada()) filaSincronizar().catch(()=>{}); });
+
+/* STATUS EM TEMPO REAL: a cada 45 s (e ao voltar para o app) busca o estado
+   da frota na nuvem e redesenha as telas de consulta. Antes o app só
+   baixava dados no login — um celular aberto há horas mostrava veículos
+   já retirados como disponíveis. Não interrompe formulários nem o assistente. */
+const TELAS_ATUALIZAVEIS=["dashboard","veiculos","veiculo-det","mot-home","mot-devolver","map","calibragem","alertas","abastecimentos","mot-abast","mot-hist","motoristas"];
+let ARG_ATUAL=null;
+async function atualizarTela(forcar){
+  if(!SESSION || !apiConfigurada() || document.hidden) return;
+  if(!forcar && Date.now()-ULTIMO_PULL<30000) return;
+  try{ await nuvemPull(); }catch(e){ return; }
+  const modalAberto=$("#modal-bg")?.classList.contains("show");
+  const camAberta=$("#cam-bg")?.classList.contains("show");
+  if(!modalAberto && !camAberta && TELAS_ATUALIZAVEIS.includes(CURRENT)){
+    const y=window.scrollY; go(CURRENT,ARG_ATUAL); window.scrollTo(0,y);
+  }
+}
+setInterval(()=>{ atualizarTela(false); }, 45000);
+document.addEventListener("visibilitychange",()=>{ if(!document.hidden) atualizarTela(true); });
 
 /* ============================================================
    VEGAS FROTA — Sistema de Controle de Frota
@@ -544,12 +702,22 @@ async function nuvemPushTabela(aba){
    ============================================================ */
 
 /* ---------- DB (localStorage) ---------- */
-const DB_KEY = "vegasfrota_db_v1";
+const DB_KEY = "vegasnit_db_v1";
 let DB = load();
 
+/* Garante que todas as tabelas existem (bancos antigos não tinham
+   "calibragens", por exemplo) e que nada vem como null. */
+function normalizarDB(db){
+  db=db||{};
+  TABELAS.forEach(t=>{ if(!Array.isArray(db[t])) db[t]=[]; });
+  const seeds=TABELAS_SEED();
+  Object.keys(seeds).forEach(t=>{ if(!db[t].length) db[t]=seeds[t].slice(); });
+  db._seq=+db._seq||100;
+  return db;
+}
 function load(){
   const raw = localStorage.getItem(DB_KEY);
-  if(raw){ try{ return JSON.parse(raw); }catch(e){} }
+  if(raw){ try{ return normalizarDB(JSON.parse(raw)); }catch(e){ console.error("Banco local corrompido:",e); } }
   const fresh = {
     usuarios: SEED_USUARIOS,
     motoristas: SEED_MOTORISTAS,
@@ -560,13 +728,31 @@ function load(){
     abastecimentos: [],
     manutencoes: [],
     ocorrencias: [],
+    calibragens: [],
     auditoria: [],
     _seq: 100
   };
   localStorage.setItem(DB_KEY, JSON.stringify(fresh));
   return fresh;
 }
-function save(){ localStorage.setItem(DB_KEY, JSON.stringify(DB)); }
+/* CORREÇÃO: o save() antigo não tratava "armazenamento cheio". Quando o
+   localStorage lotava (fotos + auditoria), a gravação falhava em silêncio:
+   o registro existia só na memória e sumia ao atualizar a página. */
+function save(){
+  const txt=JSON.stringify(DB);
+  try{ localStorage.setItem(DB_KEY, txt); return true; }
+  catch(e){
+    console.warn("Armazenamento cheio, liberando espaço:",e);
+    try{
+      if(DB.auditoria.length>300) DB.auditoria=DB.auditoria.slice(0,300);
+      localStorage.setItem(DB_KEY, JSON.stringify(DB)); return true;
+    }catch(e2){
+      alert("ATENÇÃO: o armazenamento deste aparelho está cheio e o registro pode não ter sido salvo aqui.\n"+
+            (apiConfigurada()?"Ele foi enviado para a nuvem — atualize a página com internet.":"Conecte a nuvem ou libere espaço no navegador."));
+      return false;
+    }
+  }
+}
 /* Salva local e empurra as tabelas alteradas para a nuvem (se configurada).
    Uso: saveSync(["retiradas","veiculos"]).  Sem argumento = só salva local. */
 function saveSync(abas){
@@ -576,7 +762,8 @@ function saveSync(abas){
     if(typeof api==="function"){ Promise.resolve(api("setSeq",{v:DB._seq})).catch(()=>{}); }
   }
 }
-function uid(pfx){ DB._seq++; return (pfx||"id")+DB._seq+Math.random().toString(36).slice(2,6); }
+/* ID único: sequência + hora + aleatório. Dois celulares não geram o mesmo ID. */
+function uid(pfx){ DB._seq++; return (pfx||"id")+DB._seq+Date.now().toString(36)+Math.random().toString(36).slice(2,6); }
 
 /* ---------- IndexedDB para fotos (base64) ---------- */
 let IDB=null;
@@ -732,7 +919,7 @@ async function processarAnexo(file){
 
 /* ---------- SESSÃO / LOGIN ---------- */
 let SESSION=null;
-const SES_KEY="vegasfrota_session";
+const SES_KEY="vegasnit_session";
 
 function toggleSenha(){
   const inp=$("#adm-senha"), btn=$("#toggle-senha");
@@ -810,6 +997,8 @@ function enterApp(){
   buildNav();
   const first=SESSION.tipo==="motorista"?"mot-home":"dashboard";
   go(first);
+  // ao abrir (inclusive depois de atualizar a página) busca o estado atual da frota
+  if(apiConfigurada()) setTimeout(()=>atualizarTela(true),50);
 }
 
 /* ---------- NAVEGAÇÃO ---------- */
@@ -822,7 +1011,8 @@ const NAV_ADMIN=[
 const NAV_MOT=[
   {id:"mot-home",ic:"🏠",lbl:"Início"},
   {id:"mot-hist",ic:"📋",lbl:"Meus registros"},
-  {id:"mot-abast",ic:"⛽",lbl:"Abastecer"}
+  {id:"mot-abast",ic:"⛽",lbl:"Abastecer"},
+  {id:"calibragem",ic:"🛞",lbl:"Calibragem"}
 ];
 function buildNav(){
   const nav=$(".bottomnav"); nav.innerHTML="";
@@ -841,7 +1031,7 @@ function setActiveNav(pg){
 
 let CURRENT="";
 function go(pg,arg){
-  CURRENT=pg;
+  CURRENT=pg; ARG_ATUAL=arg;
   setActiveNav(pg);
   window.scrollTo(0,0);
   const el=$("#view");
@@ -856,6 +1046,7 @@ function openMoreMenu(){
     {id:"motoristas",ic:"👨‍✈️",t:"Motoristas"},
     {id:"destinos",ic:"📍",t:"Destinos"},
     {id:"abastecimentos",ic:"⛽",t:"Abastecimentos"},
+    {id:"calibragem",ic:"🛞",t:"Calibragem dos pneus"},
     {id:"manutencao",ic:"🔧",t:"Manutenção"},
     {id:"ocorrencias",ic:"⚠️",t:"Ocorrências"},
     {id:"custos",ic:"💰",t:"Custos & Ranking"},
@@ -993,11 +1184,12 @@ async function reenviarFotosLocais(){
     if(d.checklist) for(const i in d.checklist){ const c=d.checklist[i]; if(c && ehLocal(c.foto)) c.foto=await subir(c.foto); }
   }
   // abastecimentos (cupom)
-  for(const a of DB.abastecimentos){ if(ehLocal(a.cupom)) a.cupom=await subir(a.cupom); }
+  for(const a of DB.abastecimentos){ if(ehLocal(a.cupom)) a.cupom=await subir(a.cupom); if(ehLocal(a.fotoPainel)) a.fotoPainel=await subir(a.fotoPainel); }
+  for(const m of DB.manutencoes){ if(ehLocal(m.foto)) m.foto=await subir(m.foto); }
   // ocorrências (lista de fotos)
   for(const o of DB.ocorrencias){ if(Array.isArray(o.fotos)) for(let i=0;i<o.fotos.length;i++){ if(ehLocal(o.fotos[i])) o.fotos[i]=await subir(o.fotos[i]); } }
 
-  saveSync(["retiradas","devolucoes","abastecimentos","ocorrencias"]);
+  saveSync(["retiradas","devolucoes","abastecimentos","manutencoes","ocorrencias"]);
   alert("Reenvio concluído.\nFotos enviadas: "+enviadas+"\nNão encontradas neste aparelho: "+faltando+"\nTotal verificado: "+total+
         (faltando?"\n\nAs não encontradas foram tiradas em outro aparelho. Rode esta opção também naquele aparelho.":""));
 }
@@ -1047,42 +1239,144 @@ function desconectarNuvem(){
 
 /* helpers de status */
 function vStatusTag(s){
-  const m={"Disponível":"green","Em uso":"red","Manutenção":"orange","Indisponível":"gray"};
-  const e={"Disponível":"🟢","Em uso":"🔴","Manutenção":"🟠","Indisponível":"⚫"};
+  const m={"Disponível":"green","Em uso":"red","Manutenção":"orange","Indisponível":"gray","Reservado":"blue"};
+  const e={"Disponível":"🟢","Em uso":"🔴","Manutenção":"🟡","Indisponível":"⚫","Reservado":"🔵"};
   return `<span class="tag ${m[s]||"gray"}">${e[s]||""} ${s}</span>`;
 }
 function veiculo(id){return DB.veiculos.find(v=>v.id===id);}
 function motorista(id){return DB.motoristas.find(m=>m.id===id);}
 function destino(id){return DB.destinos.find(d=>d.id===id);}
-function retiradaAberta(vid){return DB.retiradas.find(r=>r.veiculoId===vid && !r.devolvida);}
+/* ================================================================
+   ESTADO DO VEÍCULO — calculado a partir do histórico (fonte da verdade)
+   O veículo é a entidade principal: status, motorista atual e KM atual
+   são deduzidos das retiradas/devoluções/abastecimentos vinculados ao ID
+   dele. Assim, mesmo que o campo "status" gravado fique desatualizado
+   (outro aparelho, internet caindo), o sistema mostra o estado correto.
+   ================================================================ */
+function retiradasAbertas(vid){
+  return DB.retiradas.filter(r=>r.veiculoId===vid && !r.devolvida)
+    .sort((a,b)=>new Date(b.data)-new Date(a.data));
+}
+function retiradaAberta(vid){ return retiradasAbertas(vid)[0]; }
+const STATUS_MANUAIS=["Manutenção","Indisponível","Reservado"];
+/* Em uso = existe retirada aberta. Senão vale o status manual
+   (Manutenção/Indisponível/Reservado). Senão, Disponível. */
+function statusVeiculo(v){
+  if(!v) return "Indisponível";
+  if(retiradaAberta(v.id)) return "Em uso";
+  if(STATUS_MANUAIS.includes(v.status)) return v.status;
+  return "Disponível";
+}
+function veiculoDisponivel(v){ return statusVeiculo(v)==="Disponível"; }
+/* Todas as leituras de KM de um veículo, em ordem cronológica. */
+function kmLeituras(vid){
+  const out=[];
+  const nomeM=(id,nome)=>nome||motorista(id)?.nome||"—";
+  DB.retiradas.filter(r=>r.veiculoId===vid).forEach(r=>out.push({data:r.data,evento:"Retirada",km:+r.kmInicial||0,motorista:nomeM(r.motoristaId,r.motoristaNome),ref:r.id}));
+  DB.devolucoes.filter(d=>d.veiculoId===vid).forEach(d=>out.push({data:d.data,evento:d.automatica?"Entrega (automática)":"Entrega",km:+d.kmFinal||0,motorista:nomeM(d.motoristaId,d.motoristaNome),ref:d.id}));
+  DB.abastecimentos.filter(a=>a.veiculoId===vid && a.tipo!=="gerador" && +a.km>0).forEach(a=>out.push({data:a.data,evento:"Abastecimento",km:+a.km,motorista:nomeM(a.motoristaId),ref:a.id}));
+  DB.manutencoes.filter(m=>m.veiculoId===vid && +m.km>0).forEach(m=>out.push({data:m.data,evento:"Manutenção — "+(m.tipo||""),km:+m.km,motorista:"—",ref:m.id}));
+  (DB.calibragens||[]).filter(c=>c.veiculoId===vid && +c.km>0).forEach(c=>out.push({data:c.data,evento:"Calibragem",km:+c.km,motorista:c.responsavelNome||"—",ref:c.id}));
+  return out.sort((a,b)=>new Date(a.data)-new Date(b.data));
+}
+/* KM ATUAL = maior leitura registrada. Se o gestor corrigiu o KM
+   manualmente (kmCorrigidoEm), contam só as leituras depois da correção. */
+function kmAtual(vid){
+  const v=veiculo(vid); if(!v) return 0;
+  const corte=v.kmCorrigidoEm?new Date(v.kmCorrigidoEm).getTime():0;
+  let km=+v.km||0;
+  kmLeituras(vid).forEach(l=>{ if(corte && new Date(l.data).getTime()<=corte) return; if(l.km>km) km=l.km; });
+  return km;
+}
+const MSG_KM_INVALIDO="Quilometragem inválida. O valor informado não pode ser menor que a última quilometragem registrada.";
+/* Valida um KM informado para o veículo. Retorna "" se ok, ou a mensagem. */
+function validarKm(vid,valor,minimoExtra){
+  if(valor===""||valor==null||isNaN(+valor)) return "Informe a quilometragem.";
+  const n=+valor;
+  if(n<0) return MSG_KM_INVALIDO;
+  const minimo=Math.max(kmAtual(vid), +minimoExtra||0);
+  if(n<minimo) return MSG_KM_INVALIDO+"\n\nÚltima registrada: "+fmtKm(minimo);
+  return "";
+}
+/* Grava no registro do veículo o estado deduzido (mantém a planilha coerente). */
+function atualizarVeiculoDerivado(v,extra){
+  if(!v) return v;
+  const ab=retiradaAberta(v.id);
+  const km=kmAtual(v.id);
+  if(km>(+v.km||0)){ v.km=km; v.kmEm=nowISO(); }
+  if(ab){ v.status="Em uso"; v.motoristaAtualId=ab.motoristaId; v.retiradaAtualId=ab.id; }
+  else { if(v.status==="Em uso"||!v.status) v.status="Disponível"; v.motoristaAtualId=""; v.retiradaAtualId=""; }
+  if(extra) Object.assign(v,extra);
+  return v;
+}
+function ultimoMotorista(vid){
+  const d=DB.devolucoes.filter(x=>x.veiculoId===vid).sort((a,b)=>new Date(b.data)-new Date(a.data))[0];
+  if(!d) return null;
+  return d.motoristaNome||motorista(d.motoristaId)?.nome||null;
+}
+function ehGerador(v){
+  if(!v) return false;
+  return /gerador/i.test([v.tipo,v.interno,v.placa,v.modelo,v.marca].join(" "));
+}
+
+/* ================= CALIBRAGEM DOS PNEUS =================
+   Uma vez por semana, por VEÍCULO (não por motorista).
+   Próxima = última + 7 dias. */
+const CALIB_DIAS=7, CALIB_AVISO_DIAS=2;
+function ultimaCalibragem(vid){
+  return (DB.calibragens||[]).filter(c=>c.veiculoId===vid).sort((a,b)=>new Date(b.data)-new Date(a.data))[0]||null;
+}
+function inicioDia(d){ const x=new Date(d); x.setHours(0,0,0,0); return x; }
+function proximaCalibragem(c){ if(!c) return null; const d=inicioDia(c.data); d.setDate(d.getDate()+CALIB_DIAS); return d; }
+/* nivel: ok | prox | hoje | atrasada | sem */
+function calibStatus(vid){
+  const c=ultimaCalibragem(vid);
+  if(!c) return {nivel:"sem",cor:"red",em:"🔴",rotulo:"SEM CALIBRAGEM",ultima:null,proxima:null,dias:null,
+    msg:"CALIBRAGEM ATRASADA — nenhuma calibragem registrada. Realizar antes de utilizar o veículo."};
+  const prox=proximaCalibragem(c);
+  const dias=Math.round((prox-inicioDia(new Date()))/86400000);
+  const base={ultima:c,proxima:prox,dias};
+  if(dias<0) return {...base,nivel:"atrasada",cor:"red",em:"🔴",rotulo:"CALIBRAGEM ATRASADA",msg:"CALIBRAGEM ATRASADA — realizar antes de utilizar o veículo."};
+  if(dias===0) return {...base,nivel:"hoje",cor:"red",em:"🔴",rotulo:"CALIBRAR HOJE",msg:"Calibragem dos pneus deve ser realizada hoje."};
+  if(dias<=CALIB_AVISO_DIAS) return {...base,nivel:"prox",cor:"orange",em:"🟡",rotulo:"PRÓXIMA CALIBRAGEM",msg:"Atenção: a calibragem dos pneus deste veículo está próxima."};
+  return {...base,nivel:"ok",cor:"green",em:"🟢",rotulo:"EM DIA",msg:"Calibragem em dia."};
+}
+function calibAtrasada(vid){ const n=calibStatus(vid).nivel; return n==="atrasada"||n==="sem"; }
+function calibTag(vid){ const c=calibStatus(vid); return `<span class="tag ${c.cor}">${c.em} ${c.rotulo}</span>`; }
+/* Faixa de alerta grande (motorista vê ao acessar o veículo). */
+function calibAlertaHTML(vid){
+  const c=calibStatus(vid); if(c.nivel==="ok") return "";
+  return `<div class="alert-item ${c.cor==="red"?"red":"yellow"} calib-alert" style="margin:10px 0">
+    <span class="em">🛞</span><div class="txt"><div class="t">${c.em} ${esc(c.msg)}</div>
+    <div class="s">${c.ultima?"Última: "+dBR(c.ultima.data)+" · Próxima: "+dBR(c.proxima):"Nenhuma calibragem registrada para este veículo"}</div></div>
+    <button class="btn sm" style="width:auto;white-space:nowrap" onclick="formCalibragem('${vid}')">Registrar</button></div>`;
+}
+/* Data/hora local para inputs datetime-local.
+   CORREÇÃO: toISOString() dá o horário de Greenwich (3h a mais no Brasil),
+   então abastecimentos e ocorrências eram gravados com hora errada. */
+function localDT(d){ d=d||new Date(); const z=n=>String(n).padStart(2,"0");
+  return d.getFullYear()+"-"+z(d.getMonth()+1)+"-"+z(d.getDate())+"T"+z(d.getHours())+":"+z(d.getMinutes()); }
+function localD(d){ return localDT(d).slice(0,10); }
+/* "2026-09-25" (input date) -> ISO ao meio-dia local (evita cair no dia anterior). */
+function dataInputISO(v){ return v ? new Date(v+"T12:00:00").toISOString() : nowISO(); }
 
 /* Conserta inconsistências: veículos presos em "Em uso" e retiradas antigas
    sem devolução (que faziam o veículo aparecer em uso para sempre).
    Regra: se um veículo tem devolução MAIS RECENTE que a retirada aberta,
    aquela retirada é órfã e deve ser fechada. */
 function corrigirStatusFrota(){
-  if(!confirm("Corrigir o status da frota? Isso fecha retiradas antigas que ficaram sem devolução e ajusta os veículos parados em 'Em uso'.")) return;
+  if(!confirm("Corrigir o status da frota?\n\nFecha apenas retiradas que já têm devolução registrada e recalcula status e KM de cada veículo pelo histórico. Nenhum histórico é apagado.")) return;
   let corrigidos=0;
-  DB.veiculos.forEach(v=>{
-    const abertas=DB.retiradas.filter(r=>r.veiculoId===v.id && !r.devolvida);
-    if(!abertas.length){
-      // sem retirada aberta: se está "Em uso", deveria estar Disponível
-      if(v.status==="Em uso"){ v.status="Disponível"; corrigidos++; }
-      return;
-    }
-    // existe retirada aberta: ela é legítima só se for depois da última devolução do veículo
-    const ultimaDev=DB.devolucoes.filter(d=>d.veiculoId===v.id).sort((a,b)=>new Date(b.data)-new Date(a.data))[0];
-    abertas.forEach(r=>{
-      if(ultimaDev && new Date(ultimaDev.data) >= new Date(r.data)){
-        // houve devolução depois (ou junto) dessa retirada => órfã
-        r.devolvida=true; if(!r.devolucaoId) r.devolucaoId=ultimaDev.id; corrigidos++;
-      }
-    });
-    // recalcula status conforme sobrou retirada aberta legítima
-    const aindaAberta=DB.retiradas.some(r=>r.veiculoId===v.id && !r.devolvida);
-    if(aindaAberta){ if(v.status!=="Manutenção"&&v.status!=="Indisponível") v.status="Em uso"; }
-    else if(v.status==="Em uso"){ v.status="Disponível"; }
+  DB.retiradas.filter(r=>!r.devolvida).forEach(r=>{
+    const dev=DB.devolucoes.find(d=>d.retiradaId===r.id);
+    if(dev){ r.devolvida=true; r.devolucaoId=r.devolucaoId||dev.id; r.devolvidaEm=r.devolvidaEm||dev.data; corrigidos++; }
   });
+  DB.veiculos.forEach(v=>{
+    const antes=v.status+"|"+v.km;
+    atualizarVeiculoDerivado(v);
+    if(antes!==v.status+"|"+v.km) corrigidos++;
+  });
+  if(corrigidos) log("Corrigiu status da frota",corrigidos+" ajuste(s)");
   saveSync(["retiradas","veiculos","auditoria"]);
   toast(corrigidos? ("Frota corrigida: "+corrigidos+" ajuste(s)") : "Nada a corrigir — tudo certo");
   go("dashboard");
@@ -1094,9 +1388,14 @@ function isThisMonth(iso){ if(!iso)return false; const d=new Date(iso),n=new Dat
 /* ============ DASHBOARD ============ */
 ROUTES.dashboard=(el)=>{
   const total=DB.veiculos.length;
-  const disp=DB.veiculos.filter(v=>v.status==="Disponível").length;
-  const uso=DB.veiculos.filter(v=>v.status==="Em uso").length;
-  const man=DB.veiculos.filter(v=>v.status==="Manutenção").length;
+  const st=DB.veiculos.map(v=>statusVeiculo(v));
+  const disp=st.filter(x=>x==="Disponível").length;
+  const uso=st.filter(x=>x==="Em uso").length;
+  const man=st.filter(x=>x==="Manutenção").length;
+  const res=st.filter(x=>x==="Reservado").length;
+  const cal=DB.veiculos.filter(v=>!ehGerador(v)).map(v=>calibStatus(v.id).nivel);
+  const calAtr=cal.filter(n=>n==="atrasada"||n==="sem"||n==="hoje").length;
+  const calProx=cal.filter(n=>n==="prox").length;
   const motAtivos=DB.motoristas.filter(m=>m.status==="Ativo").length;
   const abMes=DB.abastecimentos.filter(a=>isThisMonth(a.data));
   const gastoComb=abMes.filter(a=>a.tipo!=="gerador").reduce((s,a)=>s+(+a.total||0),0);
@@ -1110,7 +1409,10 @@ ROUTES.dashboard=(el)=>{
       ${stat("🚗","Total de veículos",total,"")}
       ${stat("🟢","Disponíveis",disp,"green")}
       ${stat("🔴","Em uso",uso,"red")}
-      ${stat("🟠","Em manutenção",man,"orange")}
+      ${stat("🟡","Em manutenção",man,"orange")}
+      ${res?stat("🔵","Reservados",res,"blue"):""}
+      <div onclick="go('calibragem')" style="cursor:pointer">${stat("🛞","Calibragens atrasadas",calAtr,"red")}</div>
+      <div onclick="go('calibragem')" style="cursor:pointer">${stat("🛞","Calibragens próximas",calProx,"orange")}</div>
       ${stat("👨‍✈️","Motoristas ativos",motAtivos,"")}
       ${stat("⛽","Combustível no mês",fmtMoney(gastoComb),"gold")}
       ${stat("🛣️","KM no mês",fmtKm(kmMes),"blue")}
@@ -1118,27 +1420,46 @@ ROUTES.dashboard=(el)=>{
       ${stat("⚠️","Ocorrências abertas",occAbertas,"red")}
     </div>
 
-    <div class="section-title">Veículos em uso agora <span class="line"></span></div>
+    <div class="section-title">Veículos com cada motorista <span class="line"></span></div>
     <div style="margin-bottom:10px"><button class="btn ghost" style="width:auto;font-size:12px;padding:6px 12px" onclick="corrigirStatusFrota()">🔧 Corrigir status da frota</button></div>
     <div id="dash-uso"></div>
+
+    <div class="section-title">⛽ Abastecimentos recentes <span class="line"></span></div>
+    <div id="dash-abast"></div>
 
     <div class="section-title">Alertas recentes <span class="line"></span></div>
     <div id="dash-alertas"></div>
   </div>`;
 
-  // em uso
-  const usoList=DB.retiradas.filter(r=>!r.devolvida);
-  $("#dash-uso").innerHTML = usoList.length? `<div class="list">`+usoList.map(r=>{
-    const v=veiculo(r.veiculoId), m=motorista(r.motoristaId), d=r.destinoNome;
-    return `<div class="row-item" onclick="go('veiculo-det','${v.id}')" style="cursor:pointer">
-      <div class="av">${v.interno.replace("V-","")}</div>
-      <div class="main"><div class="t">${esc(v.interno)} · ${esc(v.placa)}</div>
-        <div class="s">${esc(m?m.nome:"—")} → ${esc(d)} · ${dtBR(r.data).split(" ")[1]}</div></div>
-      <div class="act"><span class="tag red">🔴 Em uso</span></div></div>`;
-  }).join("")+`</div>` : `<div class="empty"><div class="em">✅</div>Nenhum veículo em uso no momento</div>`;
+  // veículos em uso, agrupados por motorista
+  const usoList=DB.retiradas.filter(r=>!r.devolvida && veiculo(r.veiculoId));
+  const porMot={};
+  usoList.forEach(r=>{ const k=r.motoristaId||"_"; (porMot[k]=porMot[k]||[]).push(r); });
+  const grupos=Object.keys(porMot).map(k=>({nome:motorista(k)?.nome||porMot[k][0].motoristaNome||"Motorista não identificado",rets:porMot[k]}))
+    .sort((a,b)=>a.nome.localeCompare(b.nome,"pt-BR"));
+  $("#dash-uso").innerHTML = grupos.length? `<div class="list">`+grupos.map(g=>
+    `<div class="card" style="padding:12px 14px">
+      <div style="font-weight:700;margin-bottom:8px">👨‍✈️ ${esc(g.nome)} <span class="tag red" style="margin-left:6px">${g.rets.length} veículo(s)</span></div>
+      ${g.rets.map(r=>{ const v=veiculo(r.veiculoId);
+        return `<div class="row-item" onclick="go('veiculo-det','${v.id}')" style="cursor:pointer;margin-top:6px">
+          <div class="av">${esc(v.interno.replace("V-",""))}</div>
+          <div class="main"><div class="t">${esc(v.interno)} · ${esc(v.placa)}</div>
+            <div class="s">→ ${esc(r.destinoNome||"—")} · saída ${dtBR(r.data)} · KM ${fmtNum(r.kmInicial)}</div></div>
+          <div class="act"><span class="tag red">🔴 Em uso</span></div></div>`;}).join("")}
+    </div>`).join("")+`</div>` : `<div class="empty"><div class="em">✅</div>Nenhum veículo em uso no momento</div>`;
+
+  // abastecimentos recentes
+  const abRec=DB.abastecimentos.slice().sort((a,b)=>new Date(b.data)-new Date(a.data)).slice(0,5);
+  $("#dash-abast").innerHTML = abRec.length? `<div class="list">`+abRec.map(a=>{
+    const v=veiculo(a.veiculoId), m=motorista(a.motoristaId), ger=a.tipo==="gerador";
+    return `<div class="row-item" ${v?`onclick="go('veiculo-det','${v.id}')" style="cursor:pointer"`:""}><div class="av">${ger?"🔌":"⛽"}</div>
+      <div class="main"><div class="t">${ger?esc(a.gerador||"Gerador"):esc((v?.interno||"—")+" · "+(v?.placa||""))} · ${a.litros} ${unidadeAbast(a)}</div>
+      <div class="s">${dtBR(a.data)} · ${esc(m?.nome||"—")}${a.km?" · KM "+fmtNum(a.km):""} · ${fmtMoney(a.total)}</div></div>
+      ${a.fotoPainel?'<span class="tag green">📷 Painel</span>':""}</div>`;
+  }).join("")+`</div>` : `<div class="empty"><div class="em">⛽</div>Nenhum abastecimento</div>`;
 
   // alertas
-  const al=computeAlertas().slice(0,5);
+  const al=computeAlertas(true).slice(0,6);
   $("#dash-alertas").innerHTML = al.length? `<div class="list">`+al.map(a=>
     `<div class="alert-item ${a.level}"><span class="em">${a.em}</span>
       <div class="txt"><div class="t">${esc(a.t)}</div><div class="s">${esc(a.s)}</div></div></div>`).join("")+`</div>`
@@ -1158,22 +1479,26 @@ ROUTES.veiculos=(el)=>{
       <button class="btn sm" style="width:auto;white-space:nowrap" onclick="formVeiculo()">＋ Novo</button>
     </div>
     <div class="chips" id="v-chips">
-      ${["Todos","Disponível","Em uso","Manutenção","Indisponível"].map((s,i)=>`<button class="${i===0?'on':''}" data-f="${s}">${s}</button>`).join("")}
+      ${["Todos","Disponível","Em uso","Manutenção","Indisponível","Calibragem atrasada"].map((s,i)=>`<button class="${i===0?'on':''}" data-f="${s}">${s}</button>`).join("")}
     </div>
     <div id="v-list" class="list"></div>
   </div>`;
   let filt="Todos", q="";
   const render=()=>{
     let arr=DB.veiculos.slice();
-    if(filt!=="Todos") arr=arr.filter(v=>v.status===filt);
+    if(filt==="Calibragem atrasada") arr=arr.filter(v=>!ehGerador(v)&&calibAtrasada(v.id));
+    else if(filt!=="Todos") arr=arr.filter(v=>statusVeiculo(v)===filt);
     if(q) arr=arr.filter(v=>(v.placa+v.interno+v.modelo+v.marca).toLowerCase().includes(q));
     $("#v-list").innerHTML = arr.length? arr.map(v=>{
       const r=retiradaAberta(v.id); const m=r?motorista(r.motoristaId):null;
-      return `<div class="row-item" onclick="go('veiculo-det','${v.id}')" style="cursor:pointer">
-        <div class="av">${v.tipo==="Moto"?"🏍️":v.interno.replace("V-","")}</div>
+      const atr=!ehGerador(v)&&calibAtrasada(v.id);
+      const ult=!r?ultimoMotorista(v.id):null;
+      return `<div class="row-item ${atr?"calib-atrasada":""}" onclick="go('veiculo-det','${v.id}')" style="cursor:pointer">
+        <div class="av">${v.tipo==="Moto"?"🏍️":esc(v.interno.replace("V-",""))}</div>
         <div class="main"><div class="t">${esc(v.interno)} · ${esc(v.placa)}</div>
-          <div class="s">${esc([v.marca,v.modelo].filter(Boolean).join(" ")||v.tipo)}${m?" · "+esc(m.nome):""} · ${fmtKm(v.km)}</div></div>
-        <div class="act">${vStatusTag(v.status)}</div></div>`;
+          <div class="s">${esc([v.marca,v.modelo].filter(Boolean).join(" ")||v.tipo)}${m?" · 👨‍✈️ <b>"+esc(m.nome)+"</b>":(ult?" · último: "+esc(ult):"")} · ${fmtKm(kmAtual(v.id))}</div>
+          ${atr?`<div class="s" style="color:var(--red);font-weight:700">🛞 ${esc(calibStatus(v.id).rotulo)}</div>`:""}</div>
+        <div class="act">${vStatusTag(statusVeiculo(v))}</div></div>`;
     }).join("") : `<div class="empty"><div class="em">🚗</div>Nenhum veículo</div>`;
   };
   render();
@@ -1191,12 +1516,14 @@ function formVeiculo(id){
     </div>
     <div class="two">${fld("marca","Marca")}${fld("modelo","Modelo")}</div>
     <div class="two">${fld("ano","Ano","number")}${fld("cor","Cor")}</div>
-    <label>Tipo</label><select id="vf-tipo">${["Carro","Moto","Van","Caminhonete","Outro"].map(o=>`<option ${v.tipo===o?"selected":""}>${o}</option>`).join("")}</select>
+    <label>Tipo</label><select id="vf-tipo">${["Carro","Moto","Van","Caminhonete","Gerador","Outro"].map(o=>`<option ${v.tipo===o?"selected":""}>${o}</option>`).join("")}</select>
     <label>Combustível</label><select id="vf-combustivel">${["Flex","Gasolina","Etanol","Diesel","GNV","Elétrico"].map(o=>`<option ${v.combustivel===o?"selected":""}>${o}</option>`).join("")}</select>
-    <div class="two">${fld("tanque","Capacidade do tanque (L)","number")}${fld("km","KM atual","number")}</div>
+    <div class="two">${fld("tanque","Capacidade do tanque (L)","number")}<div><label>KM atual</label><input id="vf-km" type="number" value="${esc(id?kmAtual(id):(v.km||0))}"></div></div>
+    ${id?`<div class="hint">KM atual calculado pelo histórico. Só o gestor pode reduzir (correção de erro de digitação).</div>`:""}
     <div class="two">${fld("renavam","Renavam")}${fld("chassi","Chassi")}</div>
     ${fld("aquisicao","Data de aquisição","date")}
-    <label>Status</label><select id="vf-status">${["Disponível","Em uso","Manutenção","Indisponível"].map(o=>`<option ${v.status===o?"selected":""}>${o}</option>`).join("")}</select>
+    ${id&&retiradaAberta(id)?`<label>Status</label><div class="hint" style="color:var(--red);font-weight:700">🔴 Em uso com ${esc(motorista(retiradaAberta(id).motoristaId)?.nome||"motorista")} — o status volta a Disponível ao registrar a entrega.</div><input type="hidden" id="vf-status" value="Em uso">`
+      :`<label>Status</label><select id="vf-status">${["Disponível","Manutenção","Indisponível","Reservado"].map(o=>`<option ${statusVeiculo(v)===o||(!id&&o==="Disponível")?"selected":""}>${o}</option>`).join("")}</select>`}
     <label>Observações</label><textarea id="vf-obs">${esc(v.obs||"")}</textarea>
     <div class="wizard-nav">
       <button class="btn sec" onclick="closeModal()">Cancelar</button>
@@ -1205,10 +1532,23 @@ function formVeiculo(id){
 }
 function saveVeiculo(id){
   const g=k=>$("#vf-"+k).value;
-  const data={interno:g("interno"),placa:g("placa").toUpperCase(),marca:g("marca"),modelo:g("modelo"),ano:g("ano"),cor:g("cor"),tipo:g("tipo"),combustivel:g("combustivel"),tanque:+g("tanque")||0,km:+g("km")||0,renavam:g("renavam"),chassi:g("chassi"),aquisicao:g("aquisicao"),status:g("status"),obs:g("obs")};
+  const data={interno:g("interno").trim(),placa:g("placa").toUpperCase().trim(),marca:g("marca"),modelo:g("modelo"),ano:g("ano"),cor:g("cor"),tipo:g("tipo"),combustivel:g("combustivel"),tanque:+g("tanque")||0,renavam:g("renavam"),chassi:g("chassi"),aquisicao:g("aquisicao"),status:g("status"),obs:g("obs")};
   if(!data.placa){toast("Informe a placa");return;}
-  if(id){ const v=veiculo(id); Object.assign(v,data); log("Editou veículo",v.interno); }
-  else { DB.veiculos.push({id:uid("v"),foto:null,...data}); log("Cadastrou veículo",data.interno); }
+  const dup=DB.veiculos.find(x=>x.id!==id && String(x.placa).toUpperCase()===data.placa);
+  if(dup){ alert("Já existe um veículo com a placa "+data.placa+" ("+dup.interno+"). Cada veículo precisa ter placa única."); return; }
+  const kmInf=+g("km")||0;
+  if(id){
+    const v=veiculo(id), atual=kmAtual(id);
+    if(kmInf<atual){
+      if(SESSION.tipo==="motorista"){ alert(MSG_KM_INVALIDO); return; }
+      if(!confirm("O KM informado ("+fmtNum(kmInf)+") é MENOR que o último registrado ("+fmtNum(atual)+").\n\nIsso só deve ser feito para corrigir erro de digitação. Confirmar a correção?")) return;
+      data.km=kmInf; data.kmCorrigidoEm=nowISO(); data.kmEm=data.kmCorrigidoEm;
+      log("Corrigiu KM do veículo",v.interno+": "+fmtNum(atual)+" → "+fmtNum(kmInf));
+    } else if(kmInf>atual){ data.km=kmInf; data.kmEm=nowISO(); }
+    if(retiradaAberta(id)) data.status="Em uso";
+    Object.assign(v,data); log("Editou veículo",v.interno);
+  }
+  else { DB.veiculos.push({id:uid("v"),foto:null,...data,km:kmInf,kmEm:nowISO()}); log("Cadastrou veículo",data.interno); }
   saveSync(["veiculos","auditoria"]); closeModal(); toast("Veículo salvo"); go("veiculos");
 }
 
@@ -1233,16 +1573,36 @@ ROUTES["veiculo-det"]=async(el,id)=>{
     <div class="card" style="margin-bottom:14px">
       <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
         <div><div style="font-size:16px;font-weight:700">${esc([v.marca,v.modelo].filter(Boolean).join(" ")||v.tipo)}</div>
-          <div style="color:var(--muted);font-size:13px">${esc(v.tipo)} · ${esc(v.combustivel)} · ${fmtKm(v.km)}</div></div>
-        ${vStatusTag(v.status)}
+          <div style="color:var(--muted);font-size:13px">${esc(v.tipo)} · ${esc(v.combustivel)} · KM atual: <b style="color:var(--tx,#fff)">${fmtKm(kmAtual(id))}</b></div></div>
+        ${vStatusTag(statusVeiculo(v))}
       </div>
+      ${(()=>{ const ab=retiradaAberta(id);
+        if(ab) return `<div class="rec-lines" style="margin-top:10px">
+          <div class="rl"><span>Motorista</span><b style="color:var(--red)">👨‍✈️ ${esc(motorista(ab.motoristaId)?.nome||ab.motoristaNome||"—")}</b></div>
+          <div class="rl"><span>Retirado em</span><b>${dtBR(ab.data)}</b></div>
+          <div class="rl"><span>KM na retirada</span><b>${fmtNum(ab.kmInicial)}</b></div>
+          <div class="rl"><span>Destino</span><b>${esc(ab.destinoNome||"—")}</b></div>
+          ${retiradasAbertas(id).length>1?`<div class="rl"><span>⚠ Atenção</span><b style="color:var(--red)">${retiradasAbertas(id).length} retiradas abertas — registre a entrega de cada uma</b></div>`:""}</div>`;
+        const u=ultimoMotorista(id); return u?`<div class="hint" style="margin-top:8px">Último motorista: <b>${esc(u)}</b></div>`:""; })()}
+      ${ehGerador(v)?"":calibAlertaHTML(id)}
       <div class="divider"></div>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
         <button class="btn sm" onclick="formVeiculo('${id}')">✏️ Editar</button>
+        ${retiradaAberta(id)?`<button class="btn sm" style="background:linear-gradient(150deg,#4b8ef8,#2a5fc0);color:#fff" onclick="startDevolucao('${retiradaAberta(id).id}')">🔄 Registrar entrega</button>`:""}
+        ${ehGerador(v)?"":`<button class="btn sm sec" onclick="formCalibragem('${id}')">🛞 Calibragem</button>`}
         <button class="btn sm sec" onclick="setStatus('${id}','Manutenção')">🔧 Manutenção</button>
         <button class="btn sm sec" onclick="setStatus('${id}','Disponível')">🟢 Disponível</button>
       </div>
     </div>
+    ${ehGerador(v)?"":(()=>{ const c=calibStatus(id);
+      return `<div class="section-title">🛞 Calibragem dos pneus <span class="line"></span></div>
+      <div class="card" style="margin-bottom:14px"><div class="rec-lines">
+        <div class="rl"><span>Status</span><b>${calibTag(id)}</b></div>
+        <div class="rl"><span>Última calibragem</span><b>${c.ultima?dtBR(c.ultima.data):"—"}</b></div>
+        <div class="rl"><span>KM na calibragem</span><b>${c.ultima&&c.ultima.km?fmtNum(c.ultima.km):"—"}</b></div>
+        <div class="rl"><span>Responsável</span><b>${esc(c.ultima?.responsavelNome||"—")}</b></div>
+        <div class="rl"><span>Próxima</span><b>${c.proxima?dBR(c.proxima):"—"}</b></div>
+      </div></div>`; })()}
 
     <div class="section-title">💰 Painel financeiro <span class="line"></span></div>
     <div class="grid g2">
@@ -1256,23 +1616,34 @@ ROUTES["veiculo-det"]=async(el,id)=>{
       ${stat("🧮","Custo por KM",custoKm?fmtMoney(custoKm)+"/km":"—","")}
     </div>
 
+    <div class="section-title">🛣️ Histórico de quilometragem <span class="line"></span></div>
+    <div id="v-kmhist"></div>
+
     <div class="section-title">🕐 Histórico completo <span class="line"></span></div>
     <div id="v-timeline"></div>
   </div>`;
+  const lk=kmLeituras(id).slice().reverse();
+  $("#v-kmhist").innerHTML = lk.length?`<div class="table-wrap"><table><thead><tr><th>Data</th><th>Evento</th><th style="text-align:right">KM</th><th>Motorista</th></tr></thead>
+    <tbody>${lk.map(l=>`<tr><td>${dtBR(l.data)}</td><td>${esc(l.evento)}</td><td style="text-align:right">${fmtNum(l.km)}</td><td>${esc(l.motorista)}</td></tr>`).join("")}</tbody></table></div>`
+    :'<div class="empty"><div class="em">🛣️</div>Nenhuma leitura de KM ainda</div>';
   renderTimeline($("#v-timeline"),id);
 };
 function setStatus(id,st){
   const v=veiculo(id);
-  if(st!=="Manutenção" && retiradaAberta(id)){toast("Veículo em uso — faça a devolução primeiro");return;}
+  if(retiradaAberta(id)){toast("Veículo em uso — registre a entrega primeiro");return;}
   v.status=st; saveSync(["veiculos","auditoria"]); log("Alterou status da viatura",v.interno+" → "+st); toast("Status: "+st); go("veiculo-det",id);
 }
 
 function renderTimeline(box,vid){
   const ev=[];
-  DB.retiradas.filter(r=>r.veiculoId===vid).forEach(r=>ev.push({d:r.data,em:"🚗",t:"Retirada",s:`${motorista(r.motoristaId)?.nome||"—"} · KM ${fmtNum(r.kmInicial)} · ${esc(r.destinoNome)}`, fotoBtn:`ret:${r.id}`}));
-  DB.devolucoes.filter(x=>x.veiculoId===vid).forEach(x=>ev.push({d:x.data,em:"🔄",t:x.automatica?"Devolução automática":"Devolução",s:`KM ${fmtNum(x.kmFinal)} · percorrido ${fmtNum(x.kmPercorrido)} km${x.automatica?" · gerada na nova retirada":""}`, fotoBtn:`dev:${x.id}`}));
-  DB.abastecimentos.filter(a=>a.veiculoId===vid).forEach(a=>ev.push({d:a.data,em:"⛽",t:"Abastecimento",s:`${a.litros} ${unidadeAbast(a)} · ${fmtMoney(a.total)}`, fotoBtn: a.cupom?`ab:${a.id}`:null}));
-  DB.manutencoes.filter(m=>m.veiculoId===vid).forEach(m=>ev.push({d:m.data,em:"🔧",t:"Manutenção — "+esc(m.tipo),s:`${esc(m.descricao||"")} · ${fmtMoney(m.valor)}`}));
+  const nm=(id,n)=>esc(motorista(id)?.nome||n||"—");
+  const por=x=>x.registradoPor?` · registrado por ${esc(x.registradoPor)}`:"";
+  const ob=x=>x.obs?`<br>📝 ${esc(x.obs)}`:"";
+  DB.retiradas.filter(r=>r.veiculoId===vid).forEach(r=>ev.push({d:r.data,em:"🚗",t:"Retirada"+(r.devolvida?"":" — EM USO"),s:`👨‍✈️ ${nm(r.motoristaId,r.motoristaNome)} · KM ${fmtNum(r.kmInicial)} · ${esc(r.destinoNome)}${por(r)}${ob(r)}`, fotoBtn:`ret:${r.id}`}));
+  DB.devolucoes.filter(x=>x.veiculoId===vid).forEach(x=>ev.push({d:x.data,em:"🔄",t:x.automatica?"Entrega automática":"Entrega",s:`👨‍✈️ ${nm(x.motoristaId,x.motoristaNome)} · KM ${fmtNum(x.kmFinal)} · percorrido ${fmtNum(x.kmPercorrido)} km${x.automatica?" · gerada automaticamente (versão antiga)":""}${por(x)}${ob(x)}`, fotoBtn:`dev:${x.id}`}));
+  DB.abastecimentos.filter(a=>a.veiculoId===vid).forEach(a=>ev.push({d:a.data,em:"⛽",t:"Abastecimento",s:`${nm(a.motoristaId)} · ${a.km?"KM "+fmtNum(a.km)+" · ":""}${a.litros} ${unidadeAbast(a)} · ${fmtMoney(a.total)}${a.posto?" · "+esc(a.posto):""}${a.fotoPainel?" · 📷 foto do painel":""}${ob(a)}`, fotoBtn: (a.cupom||a.fotoPainel)?`ab:${a.id}`:null}));
+  DB.manutencoes.filter(m=>m.veiculoId===vid).forEach(m=>ev.push({d:m.data,em:"🔧",t:"Manutenção — "+esc(m.tipo),s:`${esc(m.descricao||"")}${m.km?" · KM "+fmtNum(m.km):""} · ${fmtMoney(m.valor)}`}));
+  (DB.calibragens||[]).filter(c=>c.veiculoId===vid).forEach(c=>ev.push({d:c.data,em:"🛞",t:"Calibragem dos pneus",s:`${esc(c.responsavelNome||"—")}${c.km?" · KM "+fmtNum(c.km):""} · próxima ${dBR(proximaCalibragem(c))}${por(c)}${ob(c)}`}));
   DB.ocorrencias.filter(o=>o.veiculoId===vid).forEach(o=>ev.push({d:o.data,em:"⚠️",t:"Ocorrência — "+esc(o.tipo),s:esc(o.descricao||"")}));
   ev.sort((a,b)=>new Date(b.d)-new Date(a.d));
   box.innerHTML = ev.length? `<div class="tl">`+ev.map(e=>
@@ -1300,7 +1671,8 @@ async function verFotosMov(ref){
     FOTOS_ITENS.forEach(([k,l])=>{ if(d.fotos?.[k]) pares.push([l, d.fotos[k]]); });
   } else if(tipo==="ab"){
     const a=DB.abastecimentos.find(x=>x.id===id); if(!a){toast("Registro não encontrado");return;}
-    titulo="Cupom do abastecimento";
+    titulo="Fotos do abastecimento";
+    if(a.fotoPainel) pares.push(["Painel / quilometragem", a.fotoPainel]);
     if(a.cupom) pares.push(["Cupom fiscal", a.cupom]);
   }
   openModal(titulo, `<div id="fotos-mov"><div class="empty">Carregando fotos...</div></div>`);
@@ -1559,7 +1931,7 @@ const FOTOS_OBRIGATORIAS=["frente","traseira","direito","esquerdo","painel"];
 const NIVEL_COMB=["Reserva","1/4","1/2","3/4","Cheio"];
 
 /* estado do wizard (rascunho salvo) */
-const WZ_KEY="vegasfrota_wizard_draft";
+const WZ_KEY="vegasnit_wizard_draft";
 let WZ=null;
 function wzSave(){
   try{ localStorage.setItem(WZ_KEY,JSON.stringify(WZ)); }
@@ -1570,7 +1942,7 @@ function wzClear(){ localStorage.removeItem(WZ_KEY); WZ=null; }
 
 /* ---------- HOME MOTORISTA ---------- */
 ROUTES["mot-home"]=(el)=>{
-  const emUso=DB.retiradas.filter(r=>!r.devolvida && r.motoristaId===SESSION.id);
+  const emUso=DB.retiradas.filter(r=>!r.devolvida && r.motoristaId===SESSION.id && veiculo(r.veiculoId));
   const draft=wzLoad();
   el.innerHTML=`<div class="wrap">
     <h2 class="page-title">🏠 Olá, ${esc(SESSION.nome.split(/[\s,]/)[0])}!</h2>
@@ -1582,13 +1954,15 @@ ROUTES["mot-home"]=(el)=>{
       <button class="big-btn ret" onclick="go('mot-devolver')"><span class="em">🔄</span>DEVOLVER VIATURA</button>
       <button class="big-btn fuel" onclick="go('mot-abast')"><span class="em">⛽</span>ABASTECER</button>
       <button class="big-btn occ" onclick="formOcorrencia()"><span class="em">⚠️</span>OCORRÊNCIA</button>
+      <button class="big-btn calib" onclick="formCalibragem()"><span class="em">🛞</span>CALIBRAGEM</button>
     </div>
     ${emUso.length?`<div class="section-title">Suas viaturas em uso <span class="line"></span></div>
       <div class="list">${emUso.map(r=>{const v=veiculo(r.veiculoId);
-        return `<div class="row-item"><div class="av">${v.interno.replace("V-","")}</div>
+        return `<div class="row-item"><div class="av">${esc(v.interno.replace("V-",""))}</div>
           <div class="main"><div class="t">${esc(v.interno)} · ${esc(v.placa)}</div>
-          <div class="s">→ ${esc(r.destinoNome)} · saída ${dtBR(r.data).split(" ")[1]}</div></div>
-          <button class="btn sm ret" style="background:linear-gradient(150deg,#4b8ef8,#2a5fc0)" onclick="startDevolucao('${r.id}')">Devolver</button></div>`;
+          <div class="s">→ ${esc(r.destinoNome)} · saída ${dtBR(r.data)} · KM ${fmtNum(r.kmInicial)}</div></div>
+          <button class="btn sm ret" style="background:linear-gradient(150deg,#4b8ef8,#2a5fc0)" onclick="startDevolucao('${r.id}')">Devolver</button></div>
+          ${calibAlertaHTML(v.id)}`;
       }).join("")}</div>`:""}
   </div>`;
 };
@@ -1612,8 +1986,10 @@ ROUTES["mot-hist"]=(el)=>{
    ============================================================ */
 const RET_STEPS=["Motorista","Viatura","Destino","KM inicial","Checklist","Água/Óleo","Fotos","Avarias","Termo","Confirmar"];
 
-function startRetirada(){
-  WZ={mode:"retirada",step:0,
+async function startRetirada(){
+  // busca o estado mais recente da frota antes de mostrar os veículos
+  await atualizarAntes("Atualizando frota...");
+  WZ={mode:"retirada",step:0,obs:"",
     motoristaId:SESSION.tipo==="motorista"?SESSION.id:"",
     veiculoId:"",destinoId:"",destinoNome:"",finalidade:"",kmInicial:"",
     nivelComb:"",checklist:{},niveisAgua:"",niveisOleo:"",
@@ -1623,6 +1999,7 @@ function startRetirada(){
 }
 
 function renderWizard(){
+  CURRENT="wizard";
   const el=$("#view"); const s=WZ.step;
   const prog=Math.round(((s+1)/RET_STEPS.length)*100);
   el.innerHTML=`
@@ -1641,12 +2018,32 @@ function wzNav(back=true,nextLbl="Continuar",nextFn="wzNext()"){
     <button class="btn" onclick="${nextFn}">${nextLbl}</button></div>`;
 }
 function wzBack(){ wzCaptureStep(); if(WZ.step>0){WZ.step--;wzSave();renderWizard();} else cancelWizard(); }
-function wzNext(){ wzCaptureStep(); WZ.step++;wzSave();renderWizard(); }
+function wzNext(){
+  wzCaptureStep();
+  const nome=RET_STEPS[WZ.step];
+  if(nome==="Viatura"){
+    if(!WZ.veiculoId){ toast("Selecione a viatura"); return; }
+    const v=veiculo(WZ.veiculoId), ab=retiradaAberta(WZ.veiculoId);
+    if(ab){ alert(msgEmUso(v,ab)); WZ.veiculoId=""; wzSave(); renderWizard(); return; }
+  }
+  if(nome==="KM inicial"){
+    const erro=validarKm(WZ.veiculoId, WZ.kmInicial);
+    if(erro){ alert(erro); return; }
+  }
+  WZ.step++;wzSave();renderWizard();
+}
+function msgEmUso(v,ab){
+  const m=motorista(ab.motoristaId);
+  return (v?v.interno+" · "+v.placa:"Veículo")+" JÁ ESTÁ RETIRADO.\n\nMotorista: "+(m?.nome||ab.motoristaNome||"—")+
+    "\nDesde: "+dtBR(ab.data)+"\nKM na retirada: "+fmtNum(ab.kmInicial)+
+    "\n\nPara usar este veículo, primeiro registre a ENTREGA dele.";
+}
 /* Lê os campos de texto/número da etapa atual e grava no WZ.
    (os campos de seleção/foto já gravam sozinhos ao serem tocados) */
 function wzCaptureStep(){
   const km=$("#wz-km"); if(km) WZ.kmInicial=km.value.trim();
   const fin=$("#wz-finalidade"); if(fin) WZ.finalidade=fin.value.trim();
+  const obs=$("#wz-obs"); if(obs) WZ.obs=obs.value.trim();
   const dest=$("#wz-destoutro");
   if(dest && WZ.destinoId==="_outro") WZ.destinoNome=dest.value.trim();
   // descrições de checklist com problema
@@ -1670,68 +2067,55 @@ function stMotorista(b){
 }
 function pickMot(id){ WZ.motoristaId=id;wzSave();stMotorista($("#wz-body")); }
 
-/* etapa 2 - veículo (TODOS aparecem, inclusive os não devolvidos) */
+/* etapa 2 - veículo
+   CORREÇÃO: antes, veículos retirados podiam ser escolhidos de novo e o
+   sistema gerava uma "devolução automática", apagando o vínculo com o
+   motorista que estava com ele. Agora veículo em uso NÃO pode ser escolhido. */
 function stVeiculo(b){
-  const ordem={"Disponível":0,"Em uso":1,"Manutenção":2,"Indisponível":3};
-  const list=DB.veiculos.slice().sort((a,b2)=>
-    ((ordem[a.status]??9)-(ordem[b2.status]??9)) || (a.interno||"").localeCompare(b2.interno||"","pt-BR"));
-  b.innerHTML=`<h3>Qual viatura?</h3><p class="desc">Todas as viaturas aparecem. Se estiver com retirada aberta, a devolução é registrada automaticamente ao selecionar.</p>
-    ${list.length?`<div class="pick">${list.map(v=>{
-      const ab=retiradaAberta(v.id);
-      const m=ab?motorista(ab.motoristaId):null;
-      const sub = ab
-        ? `🔴 NÃO DEVOLVIDO — ${esc(m?.nome||"motorista")} · saída ${dtBR(ab.data)}`
-        : `${esc([v.marca,v.modelo].filter(Boolean).join(" ")||v.tipo)} · ${fmtKm(v.km)}`;
-      const alerta = (!ab && (v.status==="Manutenção"||v.status==="Indisponível")) ? ` · ${esc(v.status)}` : "";
-      return `<div class="opt ${WZ.veiculoId===v.id?"sel":""}" onclick="pickVeic('${v.id}')">
-      <div class="av">${v.tipo==="Moto"?"🏍️":v.interno.replace("V-","")}</div>
-      <div class="info"><div class="t">${esc(v.interno)} · ${esc(v.placa)}${alerta}</div>
-      <div class="s" ${ab?'style="color:var(--red);font-weight:700"':''}>${sub}</div></div><div class="chk"></div></div>`;
-    }).join("")}</div>`
-      :'<div class="empty"><div class="em">🚗</div>Nenhum veículo cadastrado</div>'}
+  const ord=(a,b2)=>(a.interno||"").localeCompare(b2.interno||"","pt-BR");
+  const livres=DB.veiculos.filter(v=>veiculoDisponivel(v)&&!ehGerador(v)).sort(ord);
+  const bloq=DB.veiculos.filter(v=>(statusVeiculo(v)==="Manutenção"||statusVeiculo(v)==="Indisponível"||statusVeiculo(v)==="Reservado")&&!ehGerador(v)).sort(ord);
+  const emUso=DB.veiculos.filter(v=>statusVeiculo(v)==="Em uso").sort(ord);
+  const optLivre=v=>{
+    const atr=calibAtrasada(v.id), cs=calibStatus(v.id);
+    return `<div class="opt ${WZ.veiculoId===v.id?"sel":""} ${atr?"calib-atrasada":""}" onclick="pickVeic('${v.id}')">
+      <div class="av">${v.tipo==="Moto"?"🏍️":esc(v.interno.replace("V-",""))}</div>
+      <div class="info"><div class="t">${esc(v.interno)} · ${esc(v.placa)}${statusVeiculo(v)!=="Disponível"?" · "+esc(statusVeiculo(v)):""}</div>
+      <div class="s">${esc([v.marca,v.modelo].filter(Boolean).join(" ")||v.tipo)} · ${fmtKm(kmAtual(v.id))}</div>
+      ${cs.nivel!=="ok"?`<div class="s" style="color:${cs.cor==="red"?"var(--red)":"var(--gold)"};font-weight:700">🛞 ${esc(cs.rotulo)}</div>`:""}</div><div class="chk"></div></div>`;
+  };
+  const sel=WZ.veiculoId?veiculo(WZ.veiculoId):null;
+  b.innerHTML=`<h3>Qual viatura?</h3><p class="desc">Somente viaturas <b>disponíveis</b> podem ser retiradas.</p>
+    ${sel?calibAlertaHTML(sel.id):""}
+    <div class="section-title" style="margin-top:6px">🟢 Disponíveis (${livres.length}) <span class="line"></span></div>
+    ${livres.length?`<div class="pick">${livres.map(optLivre).join("")}</div>`:'<div class="empty"><div class="em">🚫</div>Nenhuma viatura disponível no momento</div>'}
+    ${bloq.length?`<div class="section-title">🟡 Manutenção / indisponíveis (${bloq.length}) <span class="line"></span></div><div class="pick">${bloq.map(optLivre).join("")}</div>`:""}
+    ${emUso.length?`<div class="section-title">🔴 Em uso — não podem ser retiradas (${emUso.length}) <span class="line"></span></div>
+      <div class="pick">${emUso.map(v=>{ const ab=retiradaAberta(v.id), m=motorista(ab.motoristaId);
+        return `<div class="opt" style="opacity:.55;cursor:not-allowed" onclick="alert(msgEmUso(veiculo('${v.id}'),retiradaAberta('${v.id}')))">
+          <div class="av">${v.tipo==="Moto"?"🏍️":esc(v.interno.replace("V-",""))}</div>
+          <div class="info"><div class="t">${esc(v.interno)} · ${esc(v.placa)}</div>
+          <div class="s" style="color:var(--red);font-weight:700">🔴 EM USO — ${esc(m?.nome||ab.motoristaNome||"motorista")} · desde ${dtBR(ab.data)}</div></div></div>`;}).join("")}</div>`:""}
     ${wzNav()}`;
-}
-
-/* Fecha as retiradas abertas do veículo gerando uma devolução automática
-   (sem checklist/fotos, marcada automatica:true para auditoria). */
-function devolverAutomatico(vid){
-  const v=veiculo(vid);
-  const abertas=DB.retiradas.filter(r=>r.veiculoId===vid && !r.devolvida)
-                            .sort((a,b)=>new Date(a.data)-new Date(b.data));
-  if(!abertas.length){ if(v && v.status==="Em uso"){ v.status="Disponível"; saveSync(["veiculos"]); } return 0; }
-  const base=abertas[abertas.length-1];
-  const did=uid("dev");
-  const kmFinal=Math.max(+((v||{}).km)||0, +base.kmInicial||0);
-  DB.devolucoes.push({id:did,retiradaId:base.id,veiculoId:vid,motoristaId:base.motoristaId,
-    kmFinal,kmPercorrido:Math.max(0,kmFinal-(+base.kmInicial||0)),
-    checklist:{},fotos:{},ocorrencia:{tem:false,tipo:"",desc:""},
-    automatica:true,data:nowISO(),
-    termo:{data:nowISO(),usuario:SESSION.nome,
-      observacao:"Devolução automática gerada na nova retirada — o registro anterior ficou sem devolução"}});
-  abertas.forEach(r=>{ r.devolvida=true; if(!r.devolucaoId) r.devolucaoId=did; });
-  if(v){ v.status="Disponível"; v.km=kmFinal; }
-  log("Devolução automática",((v||{}).interno||vid)+" — "+abertas.length+" retirada(s) aberta(s) encerrada(s)");
-  saveSync(["devolucoes","retiradas","veiculos","auditoria"]);
-  return abertas.length;
 }
 
 function pickVeic(id){
   const v=veiculo(id); if(!v) return;
   const ab=retiradaAberta(id);
-  if(ab){
-    const m=motorista(ab.motoristaId);
-    if(!confirm(v.interno+" está com retirada aberta"+((m&&m.nome)?" ("+m.nome+")":"")+" desde "+dtBR(ab.data)+
-                ".\n\nRegistrar a devolução automática agora e seguir com a nova retirada?")) return;
-    devolverAutomatico(id);
-    toast("Devolução automática registrada — "+v.interno+" liberado");
-  } else if(v.status==="Manutenção"||v.status==="Indisponível"){
-    if(!confirm(v.interno+' está marcado como "'+v.status+'".\nRetirar mesmo assim?')) return;
-    v.status="Disponível"; saveSync(["veiculos"]);
+  if(ab){ alert(msgEmUso(v,ab)); return; }
+  const st=statusVeiculo(v);
+  if(st!=="Disponível"){
+    if(SESSION.tipo==="motorista"){ alert(v.interno+' está em "'+st+'". Procure o gestor da frota.'); return; }
+    if(!confirm(v.interno+' está marcado como "'+st+'".\nLiberar e retirar mesmo assim?')) return;
+    v.status="Disponível"; log("Liberou viatura para retirada",v.interno+" ("+st+" → Disponível)"); saveSync(["veiculos","auditoria"]);
   }
   const trocou = WZ.veiculoId!==id;
   WZ.veiculoId=id;
-  if(trocou || !WZ.kmInicial) WZ.kmInicial=v.km||"";
+  if(trocou || !WZ.kmInicial) WZ.kmInicial=kmAtual(id)||"";
   wzSave(); stVeiculo($("#wz-body"));
+  // alerta de calibragem ao acessar o veículo
+  const cs=calibStatus(id);
+  if(cs.nivel!=="ok") setTimeout(()=>alert("🛞 "+v.interno+" · "+v.placa+"\n\n"+cs.msg),50);
 }
 
 /* etapa 3 - destino (entrada manual) */
@@ -1742,6 +2126,8 @@ function stDestino(b){
     <input id="wz-destoutro" value="${esc(WZ.destinoNome||"")}" placeholder="Ex.: Ronda Centro, Cliente XYZ, Rua...">
     <label style="margin-top:14px">Finalidade da saída</label>
     <input id="wz-finalidade" value="${esc(WZ.finalidade)}" placeholder="Ex.: Ronda, entrega, supervisão...">
+    <label style="margin-top:14px">Observações (opcional)</label>
+    <textarea id="wz-obs" placeholder="Qualquer informação sobre esta retirada">${esc(WZ.obs||"")}</textarea>
     <button class="btn sec sm" style="width:auto;margin-top:12px" onclick="captureGeo()">📍 Registrar minha localização atual</button>
     <div class="hint" id="geo-hint">${WZ.lat?"✓ Localização registrada":"Opcional — usa a localização no momento da saída, se você autorizar."}</div>
     ${wzNav()}`;
@@ -1750,6 +2136,7 @@ function captureGeo(){
   // preserva o que já foi digitado nesta etapa
   const dest=$("#wz-destoutro"); if(dest)WZ.destinoNome=dest.value.trim();
   const fin=$("#wz-finalidade"); if(fin)WZ.finalidade=fin.value.trim();
+  const obs=$("#wz-obs"); if(obs)WZ.obs=obs.value.trim();
   wzSave();
   if(!navigator.geolocation){toast("Geolocalização indisponível");return;}
   navigator.geolocation.getCurrentPosition(p=>{
@@ -1760,7 +2147,9 @@ function captureGeo(){
 
 /* etapa 4 - KM inicial */
 function stKm(b){
-  b.innerHTML=`<h3>Quilometragem inicial</h3><p class="desc">Informe o KM atual do painel.</p>
+  const kmUlt=kmAtual(WZ.veiculoId);
+  b.innerHTML=`<h3>Quilometragem inicial</h3><p class="desc">Informe o KM atual do painel. Última registrada: <b>${fmtKm(kmUlt)}</b></p>
+    ${calibAlertaHTML(WZ.veiculoId)}
     <label>KM inicial</label><input id="wz-km" type="number" inputmode="numeric" value="${esc(WZ.kmInicial)}" placeholder="Ex.: 85420">
     <label style="margin-top:14px">Nível de combustível na saída</label>
     <div class="fuel-row">${NIVEL_COMB.map(n=>`<button class="${WZ.nivelComb===n?"on":""}" onclick="setComb('${n}')">${n}</button>`).join("")}</div>
@@ -1899,7 +2288,10 @@ function stConfirmar(b){
       <div class="rl"><span>KM inicial</span><b>${fmtNum(WZ.kmInicial)}</b></div>
       <div class="rl"><span>Combustível</span><b>${esc(WZ.nivelComb||"—")}</b></div>
       <div class="rl"><span>Avarias</span><b>${WZ.avaria.tem?"Sim":"Não"}</b></div>
+      <div class="rl"><span>Observações</span><b>${esc(WZ.obs||"—")}</b></div>
+      <div class="rl"><span>Registrado por</span><b>${esc(SESSION.nome)}</b></div>
     </div>
+    ${calibAlertaHTML(WZ.veiculoId)}
     ${problemas.length?`<div class="alert-item red" style="margin-top:14px"><span class="em">⚠️</span>
       <div class="txt"><div class="t">Pendências obrigatórias</div><div class="s">${problemas.map(esc).join(" · ")}</div></div></div>`:""}
     <div class="wizard-nav">
@@ -1913,6 +2305,8 @@ function validateRetirada(){
   if(!WZ.veiculoId)p.push("Selecione o veículo");
   if(!WZ.destinoNome)p.push("Informe o destino");
   if(!WZ.kmInicial)p.push("Informe o KM inicial");
+  else if(WZ.veiculoId && validarKm(WZ.veiculoId,WZ.kmInicial)) p.push("Quilometragem inválida (menor que a última registrada: "+fmtKm(kmAtual(WZ.veiculoId))+")");
+  if(WZ.veiculoId && retiradaAberta(WZ.veiculoId)) p.push("Este veículo já está retirado — escolha outro");
   const chkVazio=CHECKLIST_ITENS.some((_,i)=>!WZ.checklist[i]||!WZ.checklist[i].v);
   if(chkVazio)p.push("Complete o checklist");
   const chkPbSemDesc=CHECKLIST_ITENS.some((_,i)=>WZ.checklist[i]&&WZ.checklist[i].v==="pb"&&!WZ.checklist[i].desc);
@@ -1926,53 +2320,101 @@ function validateRetirada(){
 }
 
 async function finalizarRetirada(){
+  // 1) confirma com o estado MAIS RECENTE da frota (outro celular pode ter retirado)
+  await atualizarAntes();
   const v=veiculo(WZ.veiculoId);
   if(!v){toast("Veículo não encontrado");return;}
-  // rede de segurança: se ainda restou retirada aberta, fecha automaticamente
-  if(DB.retiradas.some(r=>r.veiculoId===v.id && !r.devolvida)) devolverAutomatico(v.id);
-  if(v.status==="Manutenção"||v.status==="Indisponível"){
-    toast("Veículo em "+v.status+" — ajuste o status antes de retirar"); return;
-  }
+  const ab=retiradaAberta(v.id);
+  if(ab){ alert(msgEmUso(v,ab)); WZ.veiculoId=""; WZ.step=RET_STEPS.indexOf("Viatura"); wzSave(); renderWizard(); return; }
+  if(statusVeiculo(v)!=="Disponível"){ toast("Veículo em "+statusVeiculo(v)+" — ajuste o status antes de retirar"); return; }
+  const erroKm=validarKm(v.id, WZ.kmInicial);
+  if(erroKm){ alert(erroKm); WZ.step=RET_STEPS.indexOf("KM inicial"); wzSave(); renderWizard(); return; }
+
+  // 2) fotos
   const rid=uid("r");
   const fotoRefs={};
   let soLocal=0, totalFotos=0;
   const guarda=async(key,dataUrl)=>{ totalFotos++; const ref=await photoPut(key,dataUrl); if(!/^https?:\/\//.test(ref)) soLocal++; return ref; };
   for(const [k] of FOTOS_RET){ if(WZ.fotos[k]){const key=rid+"_ret_"+k;fotoRefs[k]=await guarda(key,WZ.fotos[k]);} }
-  // fotos da avaria (várias)
   const avariaRefs=[];
   if(WZ.avaria && WZ.avaria.fotos && WZ.avaria.fotos.length){
-    for(let i=0;i<WZ.avaria.fotos.length;i++){
-      const key=rid+"_ret_avaria"+i;
-      avariaRefs.push(await guarda(key,WZ.avaria.fotos[i]));
-    }
+    for(let i=0;i<WZ.avaria.fotos.length;i++){ avariaRefs.push(await guarda(rid+"_ret_avaria"+i,WZ.avaria.fotos[i])); }
   }
   const chk={};
-  for(const i in WZ.checklist){ const c={...WZ.checklist[i]}; if(c.foto){const key=rid+"_ret_chk"+i;c.foto=await guarda(key,c.foto);} chk[i]=c; }
-  if(apiConfigurada() && soLocal>0){
-    toast("⚠ "+soLocal+" de "+totalFotos+" fotos não subiram à nuvem — ficaram no aparelho");
-  }
+  for(const i in WZ.checklist){ const c={...WZ.checklist[i]}; if(c.foto){c.foto=await guarda(rid+"_ret_chk"+i,c.foto);} chk[i]=c; }
+  if(apiConfigurada() && soLocal>0){ toast("⚠ "+soLocal+" de "+totalFotos+" fotos não subiram à nuvem — ficaram no aparelho"); }
 
-  const reg={id:rid,veiculoId:WZ.veiculoId,motoristaId:WZ.motoristaId,
-    destinoId:WZ.destinoId,destinoNome:WZ.destinoNome,finalidade:WZ.finalidade,
+  // 3) registro completo (dados do veículo e do motorista gravados junto,
+  //    para o histórico nunca perder a referência)
+  const agora=nowISO(), mot=motorista(WZ.motoristaId);
+  const reg={id:rid,veiculoId:v.id,placa:v.placa,veiculoInterno:v.interno,
+    motoristaId:WZ.motoristaId,motoristaNome:mot?.nome||"",
+    destinoId:WZ.destinoId,destinoNome:WZ.destinoNome,finalidade:WZ.finalidade,obs:WZ.obs||"",
     kmInicial:+WZ.kmInicial,nivelComb:WZ.nivelComb,niveisAgua:WZ.niveisAgua,niveisOleo:WZ.niveisOleo,
-    checklist:chk,fotos:fotoRefs,avaria:{...WZ.avaria,fotosRefs:avariaRefs},
-    lat:WZ.lat,lng:WZ.lng,data:nowISO(),
-    termoAceite:{nome:motorista(WZ.motoristaId)?.nome,data:nowISO(),usuario:SESSION.nome},
+    checklist:chk,fotos:fotoRefs,avaria:{tem:WZ.avaria.tem,desc:WZ.avaria.desc,areas:[...(WZ.avaria.areas||[])],fotosRefs:avariaRefs},
+    lat:WZ.lat,lng:WZ.lng,data:agora,
+    registradoPor:SESSION.nome,registradoPorId:SESSION.id,registradoPorTipo:SESSION.tipo,
+    termoAceite:{nome:mot?.nome,data:agora,usuario:SESSION.nome},
     devolvida:false};
-  DB.retiradas.push(reg);
-  v.status="Em uso";
-  v.km=+WZ.kmInicial;
-  // registra ocorrência de avaria se houver
+  const extras=[];
+  let occ=null;
   if(WZ.avaria.tem){
-    DB.ocorrencias.push({id:uid("o"),veiculoId:v.id,motoristaId:WZ.motoristaId,tipo:"Avaria",
-      data:nowISO(),local:WZ.destinoNome,descricao:WZ.avaria.desc+" | Áreas: "+WZ.avaria.areas.join(", "),status:"Aberta",fotos:avariaRefs});
+    occ={id:uid("o"),veiculoId:v.id,motoristaId:WZ.motoristaId,tipo:"Avaria",
+      data:agora,local:WZ.destinoNome,descricao:WZ.avaria.desc+" | Áreas: "+WZ.avaria.areas.join(", "),status:"Aberta",fotos:avariaRefs};
+    extras.push({aba:"ocorrencias",registro:occ});
   }
-  log("Retirou viatura",v.interno);
-  saveSync(["retiradas","veiculos","ocorrencias","auditoria"]); wzClear();
+  const aud={id:uid("a"),usuario:SESSION.nome,nivel:SESSION.nivel,data:agora,acao:"Retirou viatura",
+    registro:v.interno+" · "+v.placa+" · "+(mot?.nome||"")+" · KM "+fmtNum(reg.kmInicial)};
+  extras.push({aba:"auditoria",registro:aud});
+
+  // 4) grava no SERVIDOR com trava — ele recusa se o veículo já estiver retirado
+  let offline=false;
+  if(apiConfigurada()){
+    try{
+      let r;
+      try{ r=await api("retirar",{retirada:reg,extras}); }
+      catch(e2){ if(!backendAntigo(e2)) throw e2;
+        const vv0=Object.assign({},veiculo(v.id),{status:"Em uso",km:Math.max(+v.km||0,+reg.kmInicial),kmEm:agora,motoristaAtualId:reg.motoristaId,retiradaAtualId:reg.id});
+        await api("pushMuitos",{itens:[{aba:"retiradas",registro:reg},{aba:"veiculos",registro:vv0},...extras]}); r={veiculo:vv0}; }
+      if(r.veiculo){ const i=DB.veiculos.findIndex(x=>x.id===v.id); if(i>=0){ DB.veiculos[i]=r.veiculo; marcarSync("veiculos",[r.veiculo]); } }
+      marcarSync("retiradas",[reg]);
+      extras.forEach(x=>marcarSync(x.aba,[x.registro]));
+    }catch(e){
+      if(!erroDeRede(e)){
+        const d=e.dados||{};
+        if(d.erro==="VEICULO_EM_USO"){
+          await atualizarAntes();
+          const c=d.conflito||{};
+          alert((v.interno+" · "+v.placa)+" acabou de ser retirado em outro aparelho.\n\nMotorista: "+(c.motoristaNome||"—")+
+            "\nDesde: "+dtBR(c.data)+"\n\nEscolha outro veículo.");
+          WZ.veiculoId=""; WZ.step=RET_STEPS.indexOf("Viatura"); wzSave(); renderWizard(); return;
+        }
+        if(d.erro==="KM_INVALIDO"){
+          alert(MSG_KM_INVALIDO+"\n\nÚltima registrada: "+fmtKm(d.kmAtual));
+          WZ.step=RET_STEPS.indexOf("KM inicial"); wzSave(); renderWizard(); return;
+        }
+        alert("O servidor recusou a retirada: "+e.message); return;
+      }
+      offline=true;     // sem internet: grava no aparelho e envia depois
+    }
+  }
+  // 5) grava no aparelho (persistência local)
+  DB.retiradas.push(reg);
+  if(occ) DB.ocorrencias.push(occ);
+  DB.auditoria.unshift(aud);
+  const vv=veiculo(v.id);
+  vv.status="Em uso"; vv.km=Math.max(+vv.km||0,+reg.kmInicial); vv.kmEm=agora;
+  vv.motoristaAtualId=reg.motoristaId; vv.retiradaAtualId=reg.id;
+  save(); wzClear();
+  if(offline){
+    filaAdd("retiradas",reg); filaAdd("veiculos",vv); extras.forEach(x=>filaAdd(x.aba,x.registro));
+    toast("⚠ Sem conexão: a retirada ficou salva no aparelho e será enviada automaticamente");
+  }
   showComprovanteRet(reg);
 }
 
 function showComprovanteRet(reg){
+  CURRENT="comprovante";
   const v=veiculo(reg.veiculoId),m=motorista(reg.motoristaId);
   $("#view").innerHTML=`<div class="wizard-body"><div class="card receipt">
     <div class="big-em">✅</div><h3>Viatura retirada com sucesso</h3>
@@ -1982,9 +2424,11 @@ function showComprovanteRet(reg){
       <div class="rl"><span>Placa</span><b>${esc(v.placa)}</b></div>
       <div class="rl"><span>Destino</span><b>${esc(reg.destinoNome)}</b></div>
       <div class="rl"><span>KM</span><b>${fmtNum(reg.kmInicial)}</b></div>
-      <div class="rl"><span>Horário</span><b>${dtBR(reg.data).split(" ")[1]}</b></div>
+      <div class="rl"><span>Data / hora</span><b>${dtBR(reg.data)}</b></div>
+      <div class="rl"><span>Registrado por</span><b>${esc(reg.registradoPor||"—")}</b></div>
       <div class="rl"><span>Status</span><b style="color:var(--red)">🔴 EM USO</b></div>
     </div>
+    ${calibAlertaHTML(reg.veiculoId)}
     <div style="display:flex;gap:8px">
       <button class="btn sec" onclick="gerarComprovantePDF('ret','${reg.id}')">📄 Comprovante PDF</button>
       <button class="btn" onclick="go('mot-home')">Concluir</button>
@@ -2116,24 +2560,39 @@ function removePhoto(key){
 
 /* ============ DEVOLUÇÃO ============ */
 ROUTES["mot-devolver"]=(el)=>{
-  const emUso=DB.retiradas.filter(r=>!r.devolvida && (SESSION.tipo!=="motorista"||r.motoristaId===SESSION.id));
-  el.innerHTML=`<div class="wrap"><h2 class="page-title">🔄 Devolver viatura</h2>
-    <p class="desc" style="color:var(--muted)">Selecione a viatura em uso para devolver.</p>
-    <div class="pick">${emUso.length?emUso.map(r=>{const v=veiculo(r.veiculoId),m=motorista(r.motoristaId);
-      return `<div class="opt" onclick="startDevolucao('${r.id}')"><div class="av">${v.interno.replace("V-","")}</div>
-        <div class="info"><div class="t">${esc(v.interno)} · ${esc(v.placa)}</div>
-        <div class="s">${esc(m?.nome||"")} → ${esc(r.destinoNome)} · saída ${dtBR(r.data).split(" ")[1]}</div></div>›</div>`;
-    }).join(""):'<div class="empty"><div class="em">🅿️</div>Nenhuma viatura em uso</div>'}</div></div>`;
+  const desenhar=()=>{
+    if(CURRENT!=="mot-devolver") return;
+    const emUso=DB.retiradas.filter(r=>!r.devolvida && veiculo(r.veiculoId) && (SESSION.tipo!=="motorista"||r.motoristaId===SESSION.id))
+      .sort((a,b)=>new Date(b.data)-new Date(a.data));
+    el.innerHTML=`<div class="wrap"><h2 class="page-title">🔄 Devolver viatura</h2>
+      <p class="desc" style="color:var(--muted)">Selecione a viatura em uso para registrar a entrega.</p>
+      <div class="pick">${emUso.length?emUso.map(r=>{const v=veiculo(r.veiculoId),m=motorista(r.motoristaId);
+        return `<div class="opt" onclick="startDevolucao('${r.id}')"><div class="av">${esc(v.interno.replace("V-",""))}</div>
+          <div class="info"><div class="t">${esc(v.interno)} · ${esc(v.placa)}</div>
+          <div class="s">👨‍✈️ ${esc(m?.nome||r.motoristaNome||"")} → ${esc(r.destinoNome)} · saída ${dtBR(r.data)} · KM ${fmtNum(r.kmInicial)}</div></div>›</div>`;
+      }).join(""):'<div class="empty"><div class="em">🅿️</div>Nenhuma viatura em uso'+(SESSION.tipo==="motorista"?" no seu nome":"")+'</div>'}</div></div>`;
+  };
+  desenhar();
+  // atualiza da nuvem: a retirada pode ter sido feita em outro aparelho
+  if(apiConfigurada()) nuvemPull().then(desenhar).catch(()=>{});
 };
 
-function startDevolucao(retId){
-  const r=DB.retiradas.find(x=>x.id===retId);
+async function startDevolucao(retId){
+  let r=DB.retiradas.find(x=>x.id===retId);
+  if(!r){ toast("Retirada não encontrada"); return; }
+  if(r.devolvida){
+    await atualizarAntes();
+    r=DB.retiradas.find(x=>x.id===retId);
+    if(r && r.devolvida){ alert("Esta retirada já teve a entrega registrada."); go(SESSION.tipo==="motorista"?"mot-home":"dashboard"); return; }
+  }
+  closeModal();
   WZ={mode:"devolucao",step:0,retiradaId:retId,veiculoId:r.veiculoId,motoristaId:r.motoristaId,
-    kmFinal:"",checklist:{},fotos:{},ocorrencia:{tem:false,tipo:"",desc:""},termo:false};
+    kmFinal:"",obs:"",checklist:{},fotos:{},ocorrencia:{tem:false,tipo:"",desc:""},termo:false};
   wzSave(); renderDevWizard();
 }
 const DEV_STEPS=["KM final","Checklist","Fotos","Ocorrências","Termo","Finalizar"];
 function renderDevWizard(){
+  CURRENT="wizard";
   const el=$("#view"),s=WZ.step;
   const prog=Math.round(((s+1)/DEV_STEPS.length)*100);
   el.innerHTML=`<div class="wizard-head"><div class="step-lbl"><span>ETAPA ${s+1} DE ${DEV_STEPS.length}</span><b>${DEV_STEPS[s]}</b></div>
@@ -2150,23 +2609,36 @@ function dvNext(){WZ.step++;wzSave();renderDevWizard();}
 
 function dvKm(b){
   const r=DB.retiradas.find(x=>x.id===WZ.retiradaId);
-  b.innerHTML=`<h3>Quilometragem final</h3><p class="desc">KM inicial na saída: <b>${fmtNum(r.kmInicial)}</b></p>
+  const v=veiculo(WZ.veiculoId), m=motorista(r.motoristaId);
+  const minimo=Math.max(+r.kmInicial||0, kmAtual(WZ.veiculoId));
+  b.innerHTML=`<h3>Quilometragem final</h3>
+    <div class="rec-lines" style="margin-bottom:10px">
+      <div class="rl"><span>Veículo</span><b>${esc(v?.interno||"")} · ${esc(v?.placa||"")}</b></div>
+      <div class="rl"><span>Motorista que estava usando</span><b>${esc(m?.nome||r.motoristaNome||"—")}</b></div>
+      <div class="rl"><span>Retirado em</span><b>${dtBR(r.data)}</b></div>
+      <div class="rl"><span>KM na retirada</span><b>${fmtNum(r.kmInicial)}</b></div>
+      ${minimo>(+r.kmInicial||0)?`<div class="rl"><span>Última leitura registrada</span><b>${fmtNum(minimo)}</b></div>`:""}
+    </div>
     <label>KM final</label><input id="dv-km" type="number" inputmode="numeric" value="${esc(WZ.kmFinal)}" placeholder="Ex.: 85487" oninput="WZ.kmFinal=this.value;wzSave();dvKmCalc()">
-    <div class="hint" id="dv-calc"></div>${dvNav("Continuar","dvKmGo()")}`;
+    <div class="hint" id="dv-calc"></div>
+    <label style="margin-top:14px">Observações da entrega (opcional)</label>
+    <textarea id="dv-obs" oninput="WZ.obs=this.value;wzSave()">${esc(WZ.obs||"")}</textarea>
+    ${dvNav("Continuar","dvKmGo()")}`;
   dvKmCalc();
 }
+function dvKmMin(){ const r=DB.retiradas.find(x=>x.id===WZ.retiradaId); return Math.max(+r.kmInicial||0, kmAtual(WZ.veiculoId)); }
 function dvKmCalc(){
   const r=DB.retiradas.find(x=>x.id===WZ.retiradaId);
   const h=$("#dv-calc"); if(!h)return;
   const perc=(+WZ.kmFinal)-(r.kmInicial);
   if(!WZ.kmFinal){h.textContent="";return;}
-  if(perc<0){h.innerHTML="<b style='color:var(--red)'>KM final não pode ser menor que o inicial.</b>";}
+  if(+WZ.kmFinal<dvKmMin()){h.innerHTML="<b style='color:var(--red)'>"+esc(MSG_KM_INVALIDO)+"</b>";}
   else h.innerHTML=`Percorrido: <b style="color:var(--green)">${fmtNum(perc)} km</b>`;
 }
 function dvKmGo(){
-  const r=DB.retiradas.find(x=>x.id===WZ.retiradaId);
-  if(!WZ.kmFinal){toast("Informe o KM final");return;}
-  if((+WZ.kmFinal)<r.kmInicial){toast("KM final menor que inicial");return;}
+  if(WZ.kmFinal===""||WZ.kmFinal==null){toast("Informe o KM final");return;}
+  const erro=validarKm(WZ.veiculoId, WZ.kmFinal, dvKmMin());
+  if(erro){ alert(erro); return; }
   dvNext();
 }
 function dvChecklist(b){
@@ -2207,58 +2679,113 @@ function dvFinal(b){
   if(chkVazio)probs.push("Complete o checklist");
   if(fotoFalta)probs.push("Tire as fotos obrigatórias (frente, traseira, laterais e painel)");
   if(!WZ.termo)probs.push("Aceite o termo");
+  if(validarKm(WZ.veiculoId,WZ.kmFinal,dvKmMin()))probs.push("Quilometragem inválida");
+  if(r.devolvida)probs.push("Esta retirada já teve a entrega registrada");
   b.innerHTML=`<h3>Finalizar devolução</h3>
     <div class="rec-lines">
-      <div class="rl"><span>Veículo</span><b>${esc(v.interno)}</b></div>
+      <div class="rl"><span>Veículo</span><b>${esc(v.interno)} · ${esc(v.placa)}</b></div>
+      <div class="rl"><span>Motorista</span><b>${esc(motorista(r.motoristaId)?.nome||r.motoristaNome||"—")}</b></div>
       <div class="rl"><span>KM inicial</span><b>${fmtNum(r.kmInicial)}</b></div>
       <div class="rl"><span>KM final</span><b>${fmtNum(WZ.kmFinal)}</b></div>
       <div class="rl"><span>Percorrido</span><b style="color:var(--green)">${fmtNum(perc)} km</b></div>
       <div class="rl"><span>Ocorrências</span><b>${WZ.ocorrencia.tem?"Sim":"Não"}</b></div>
+      <div class="rl"><span>Observações</span><b>${esc(WZ.obs||"—")}</b></div>
+      <div class="rl"><span>Responsável pela entrega</span><b>${esc(SESSION.nome)}</b></div>
     </div>
     ${probs.length?`<div class="alert-item red" style="margin-top:14px"><span class="em">⚠️</span><div class="txt"><div class="t">Pendências</div><div class="s">${probs.map(esc).join(" · ")}</div></div></div>`:""}
     <div class="wizard-nav"><button class="btn sec" onclick="dvBack()">‹ Voltar</button>
       <button class="btn green" ${probs.length?"disabled style='opacity:.5'":""} onclick="salvarComBotao(this, finalizarDevolucao)">✔ Finalizar devolução</button></div>`;
 }
 async function finalizarDevolucao(){
-  const r=DB.retiradas.find(x=>x.id===WZ.retiradaId),v=veiculo(WZ.veiculoId);
+  // 1) estado mais recente: a entrega pode ter sido registrada em outro aparelho
+  await atualizarAntes();
+  const r=DB.retiradas.find(x=>x.id===WZ.retiradaId), v=veiculo(WZ.veiculoId);
+  if(!r||!v){ alert("Retirada não encontrada."); return; }
+  if(r.devolvida){ alert("Esta retirada já teve a entrega registrada (em outro aparelho)."); wzClear(); go(SESSION.tipo==="motorista"?"mot-home":"dashboard"); return; }
+  const erroKm=validarKm(v.id, WZ.kmFinal, Math.max(+r.kmInicial||0, kmAtual(v.id)));
+  if(erroKm){ alert(erroKm); WZ.step=0; wzSave(); renderDevWizard(); return; }
+
+  // 2) fotos
   const did=uid("dev");
   const fotoRefs={};
   let soLocal=0, totalFotos=0;
   const guarda=async(key,dataUrl)=>{ totalFotos++; const ref=await photoPut(key,dataUrl); if(!/^https?:\/\//.test(ref)) soLocal++; return ref; };
-  for(const [k] of FOTOS_DEV){if(WZ.fotos[k]){const key=did+"_dev_"+k;fotoRefs[k]=await guarda(key,WZ.fotos[k]);}}
+  for(const [k] of FOTOS_DEV){if(WZ.fotos[k]){fotoRefs[k]=await guarda(did+"_dev_"+k,WZ.fotos[k]);}}
   const chk={};
-  for(const i in WZ.checklist){const c={...WZ.checklist[i]};if(c.foto){const key=did+"_dev_chk"+i;c.foto=await guarda(key,c.foto);}chk[i]=c;}
-  const perc=(+WZ.kmFinal)-r.kmInicial;
-  const dev={id:did,retiradaId:r.id,veiculoId:v.id,motoristaId:r.motoristaId,
-    kmFinal:+WZ.kmFinal,kmPercorrido:perc,checklist:chk,fotos:fotoRefs,
-    ocorrencia:WZ.ocorrencia,data:nowISO(),termo:{data:nowISO(),usuario:SESSION.nome}};
-  DB.devolucoes.push(dev);
-  r.devolvida=true; r.devolucaoId=did;
-  // Fecha qualquer outra retirada aberta do MESMO veículo (evita o veículo
-  // continuar aparecendo "em uso" por causa de retiradas antigas sem devolução).
-  DB.retiradas.forEach(x=>{ if(x.veiculoId===v.id && !x.devolvida){ x.devolvida=true; if(!x.devolucaoId) x.devolucaoId=did; } });
-  v.status="Disponível"; v.km=+WZ.kmFinal;
+  for(const i in WZ.checklist){const c={...WZ.checklist[i]};if(c.foto){c.foto=await guarda(did+"_dev_chk"+i,c.foto);}chk[i]=c;}
+  const agora=nowISO(), mot=motorista(r.motoristaId);
+  const perc=(+WZ.kmFinal)-(+r.kmInicial||0);
+  const dev={id:did,retiradaId:r.id,veiculoId:v.id,placa:v.placa,veiculoInterno:v.interno,
+    motoristaId:r.motoristaId,motoristaNome:mot?.nome||r.motoristaNome||"",
+    kmInicial:+r.kmInicial||0,kmFinal:+WZ.kmFinal,kmPercorrido:perc,obs:WZ.obs||"",
+    checklist:chk,fotos:fotoRefs,ocorrencia:{...WZ.ocorrencia},data:agora,
+    registradoPor:SESSION.nome,registradoPorId:SESSION.id,registradoPorTipo:SESSION.tipo,
+    termo:{data:agora,usuario:SESSION.nome}};
+  const extras=[]; let occ=null;
   if(WZ.ocorrencia.tem){
     const oid=uid("o"); let ofoto=[];
-    if(WZ.fotos.occ){const ref=await guarda(oid+"_occ", WZ.fotos.occ);ofoto=[ref];}
-    DB.ocorrencias.push({id:oid,veiculoId:v.id,motoristaId:r.motoristaId,tipo:WZ.ocorrencia.tipo,
-      data:nowISO(),local:r.destinoNome,descricao:WZ.ocorrencia.desc,status:"Aberta",fotos:ofoto});
+    if(WZ.fotos.occ){ ofoto=[await guarda(oid+"_occ", WZ.fotos.occ)]; }
+    occ={id:oid,veiculoId:v.id,motoristaId:r.motoristaId,tipo:WZ.ocorrencia.tipo,
+      data:agora,local:r.destinoNome,descricao:WZ.ocorrencia.desc,status:"Aberta",fotos:ofoto};
+    extras.push({aba:"ocorrencias",registro:occ});
   }
   if(apiConfigurada() && soLocal>0){ toast("⚠ "+soLocal+" de "+totalFotos+" fotos não subiram à nuvem — ficaram no aparelho"); }
-  log("Devolveu viatura",v.interno+" (percorrido "+perc+" km)");
-  const teveOcorrencia = !!(WZ.ocorrencia && WZ.ocorrencia.tem);   // guarda ANTES de limpar
-  saveSync(["devolucoes","retiradas","veiculos","ocorrencias","auditoria"]);wzClear();
-  const m=motorista(r.motoristaId);
+  const aud={id:uid("a"),usuario:SESSION.nome,nivel:SESSION.nivel,data:agora,acao:"Devolveu viatura",
+    registro:v.interno+" · "+v.placa+" · "+(mot?.nome||"")+" · KM "+fmtNum(dev.kmFinal)+" (percorrido "+perc+" km)"};
+  extras.push({aba:"auditoria",registro:aud});
+
+  // 3) grava no SERVIDOR com trava (recusa entrega em dobro)
+  let offline=false;
+  if(apiConfigurada()){
+    try{
+      let res;
+      try{ res=await api("devolver",{devolucao:dev,retirada:r,extras}); }
+      catch(e2){ if(!backendAntigo(e2)) throw e2;
+        const rr=Object.assign({},r,{devolvida:true,devolucaoId:did,devolvidaEm:agora});
+        await api("pushMuitos",{itens:[{aba:"devolucoes",registro:dev},{aba:"retiradas",registro:rr},...extras]}); res={}; }
+      if(res.veiculo){ const i=DB.veiculos.findIndex(x=>x.id===v.id); if(i>=0){ DB.veiculos[i]=res.veiculo; marcarSync("veiculos",[res.veiculo]); } }
+    }catch(e){
+      if(!erroDeRede(e)){
+        const d=e.dados||{};
+        if(d.erro==="JA_DEVOLVIDA"){ await atualizarAntes(); alert("A entrega deste veículo já foi registrada em outro aparelho."); wzClear(); go(SESSION.tipo==="motorista"?"mot-home":"dashboard"); return; }
+        if(d.erro==="KM_INVALIDO"){ alert(MSG_KM_INVALIDO); WZ.step=0; wzSave(); renderDevWizard(); return; }
+        alert("O servidor recusou a entrega: "+e.message); return;
+      }
+      offline=true;
+    }
+  }
+  // 4) grava no aparelho — a retirada continua no histórico, só marcada como devolvida
+  DB.devolucoes.push(dev);
+  r.devolvida=true; r.devolucaoId=did; r.devolvidaEm=agora;
+  if(occ) DB.ocorrencias.push(occ);
+  DB.auditoria.unshift(aud);
+  const vv=veiculo(v.id);
+  if((+dev.kmFinal)>(+vv.km||0)){ vv.km=+dev.kmFinal; vv.kmEm=agora; }
+  vv.ultimoMotoristaId=r.motoristaId;
+  if(!retiradaAberta(vv.id)){ if(vv.status==="Em uso"||!vv.status) vv.status="Disponível"; vv.motoristaAtualId=""; vv.retiradaAtualId=""; }
+  if(!offline && apiConfigurada()){
+    marcarSync("devolucoes",[dev]); marcarSync("retiradas",[r]); extras.forEach(x=>marcarSync(x.aba,[x.registro]));
+    marcarSync("veiculos",[vv]);
+  }
+  const teveOcorrencia=!!(WZ.ocorrencia && WZ.ocorrencia.tem);
+  save(); wzClear();
+  if(offline){
+    filaAdd("devolucoes",dev); filaAdd("retiradas",r); filaAdd("veiculos",vv); extras.forEach(x=>filaAdd(x.aba,x.registro));
+    toast("⚠ Sem conexão: a entrega ficou salva no aparelho e será enviada automaticamente");
+  }
+  CURRENT="comprovante";
   $("#view").innerHTML=`<div class="wizard-body"><div class="card receipt">
-    <div class="big-em">🟢</div><h3>Devolução finalizada</h3>
+    <div class="big-em">🟢</div><h3>Entrega registrada</h3>
     <div class="rec-lines">
-      <div class="rl"><span>Motorista</span><b>${esc(m?.nome)}</b></div>
-      <div class="rl"><span>Veículo</span><b>${esc(v.interno)}</b></div>
+      <div class="rl"><span>Motorista</span><b>${esc(dev.motoristaNome||"—")}</b></div>
+      <div class="rl"><span>Veículo</span><b>${esc(v.interno)} · ${esc(v.placa)}</b></div>
       <div class="rl"><span>KM inicial</span><b>${fmtNum(r.kmInicial)}</b></div>
       <div class="rl"><span>KM final</span><b>${fmtNum(dev.kmFinal)}</b></div>
       <div class="rl"><span>Percorrido</span><b>${fmtNum(perc)} km</b></div>
+      <div class="rl"><span>Data / hora</span><b>${dtBR(dev.data)}</b></div>
+      <div class="rl"><span>Responsável pela entrega</span><b>${esc(dev.registradoPor)}</b></div>
       <div class="rl"><span>Ocorrências</span><b>${teveOcorrencia?"Sim":"Não"}</b></div>
-      <div class="rl"><span>Status</span><b style="color:var(--green)">🟢 DISPONÍVEL</b></div>
+      <div class="rl"><span>Status</span><b style="color:var(--green)">${vStatusTag(statusVeiculo(veiculo(v.id)))}</b></div>
     </div>
     <div style="display:flex;gap:8px">
       <button class="btn sec" onclick="gerarComprovantePDF('dev','${dev.id}')">📄 Comprovante PDF</button>
@@ -2284,9 +2811,10 @@ ROUTES["mot-abast"]=ROUTES.abastecimentos=(el)=>{
     const titulo = ehGer
       ? "🔌 "+esc(a.gerador||"—")+(a.local?" · "+esc(a.local):"")
       : esc((v&&v.interno)||"—")+placa;
-    return `<div class="row-item"><div class="av">${ehGer?"🔌":"⛽"}</div>
+    const temFoto=a.fotoPainel||a.cupom;
+    return `<div class="row-item" ${temFoto?`onclick="verFotosMov('ab:${a.id}')" style="cursor:pointer"`:""}><div class="av">${ehGer?"🔌":"⛽"}</div>
       <div class="main">
-        <div class="t">${titulo} · ${a.litros} ${unidadeAbast(a)}</div>
+        <div class="t">${titulo} · ${a.litros} ${unidadeAbast(a)}${a.km?" · KM "+fmtNum(a.km):""}${a.fotoPainel?" · 📷":""}</div>
         <div class="s">${comb} · ${esc((m&&m.nome)||"Responsável não informado")}</div>
         <div class="s">${dtBR(a.data)} · ${esc(a.posto||"")} · ${fmtMoney(a.total)}</div>
       </div>
@@ -2301,6 +2829,9 @@ function formAbastecimento(tipo){
   tipo = (tipo==="gerador") ? "gerador" : "veiculo";
   const vs=DB.veiculos, ms=DB.motoristas.filter(m=>m.status==="Ativo");
   const motDefault=SESSION.tipo==="motorista"?SESSION.id:"";
+  // motorista: já sugere o veículo que está com ele
+  const veicDefault=SESSION.tipo==="motorista"?(DB.retiradas.find(r=>!r.devolvida&&r.motoristaId===SESSION.id)?.veiculoId||""):"";
+  window._painel=null; window._cupom=null;
   const geradoresUsados=[...new Set(DB.abastecimentos.filter(a=>a.tipo==="gerador"&&a.gerador).map(a=>a.gerador))];
   openModal("Registrar abastecimento",`
     <label>O que foi abastecido?</label>
@@ -2310,8 +2841,9 @@ function formAbastecimento(tipo){
     </div>
 
     <div id="ab-box-veic" style="margin-top:10px">
-      <label>Veículo</label><select id="ab-veic"><option value="">Selecione</option>${vs.map(v=>`<option value="${v.id}">${esc(v.interno)} · ${esc(v.placa)}</option>`).join("")}</select>
-      <label>KM</label><input id="ab-km" type="number" inputmode="numeric">
+      <label>Veículo</label><select id="ab-veic" onchange="abVeicMudou()"><option value="">Selecione</option>${vs.map(v=>`<option value="${v.id}" ${v.id===veicDefault?"selected":""}>${esc(v.interno)} · ${esc(v.placa)}${ehGerador(v)?" (gerador)":""}</option>`).join("")}</select>
+      <div id="ab-veic-info" class="hint"></div>
+      <label>KM (obrigatório)</label><input id="ab-km" type="number" inputmode="numeric" placeholder="KM do painel">
     </div>
 
     <div id="ab-box-ger" style="margin-top:10px;display:none">
@@ -2323,19 +2855,35 @@ function formAbastecimento(tipo){
     </div>
 
     <label>Responsável</label><select id="ab-mot"><option value="">Selecione</option>${ms.map(m=>`<option value="${m.id}" ${m.id===motDefault?"selected":""}>${esc(m.nome)}</option>`).join("")}</select>
-    <label>Data</label><input id="ab-data" type="datetime-local" value="${new Date().toISOString().slice(0,16)}">
+    <label>Data e hora</label><input id="ab-data" type="datetime-local" value="${localDT()}">
     <label>Posto</label><input id="ab-posto">
     <label>Combustível</label><select id="ab-comb" onchange="ajustaUnidadeComb()"></select>
     <div class="two"><div><label id="ab-lbl-qtd">Litros</label><input id="ab-litros" type="number" step="0.01" inputmode="decimal" oninput="calcAbast()"></div>
       <div><label id="ab-lbl-vl">Valor por litro (R$)</label><input id="ab-vl" type="number" step="0.01" inputmode="decimal" oninput="calcAbast()"></div></div>
     <div class="rec-lines" style="margin:12px 0 4px"><div class="rl"><span>Total</span><b id="ab-total">R$ 0,00</b></div></div>
     <div id="ab-box-tanque"><label>Tanque cheio?</label><div class="fuel-row" style="max-width:200px"><button type="button" class="on" id="ab-tc-sim" onclick="setTanque(true)">Sim</button><button type="button" id="ab-tc-nao" onclick="setTanque(false)">Não</button></div></div>
+    <div id="ab-box-painel"><label style="margin-top:12px">📷 Foto do painel (obrigatória) — deve mostrar a quilometragem</label>${photoSlotHTML("abpainel","Painel / KM","📊")}</div>
     <label style="margin-top:12px">Foto do cupom</label>${photoSlotHTML("cupom","Cupom fiscal","🧾")}
+    <label>Observações (opcional)</label><textarea id="ab-obs"></textarea>
     <div class="wizard-nav"><button class="btn sec" onclick="closeModal()">Cancelar</button>
       <button class="btn" onclick="salvarComBotao(this, saveAbastecimento)">Salvar</button></div>`);
   window._tanque=true;
   bindPhotoKey("cupom",u=>{window._cupom=u;});
+  bindPhotoKey("abpainel",u=>{window._painel=u;});
   setAbastTipo(tipo);
+  abVeicMudou();
+}
+/* Foto do painel: obrigatória para veículo; NÃO obrigatória para GERADOR. */
+function abExigePainel(){
+  if((window._abTipo||"veiculo")==="gerador") return false;
+  const v=veiculo(($("#ab-veic")||{}).value);
+  return !ehGerador(v);
+}
+function abVeicMudou(){
+  const v=veiculo(($("#ab-veic")||{}).value), info=$("#ab-veic-info");
+  if(info) info.innerHTML = v ? `KM atual registrado: <b>${fmtKm(kmAtual(v.id))}</b>${statusVeiculo(v)==="Em uso"?" · com "+esc(motorista(retiradaAberta(v.id).motoristaId)?.nome||""):""}`
+    +(ehGerador(v)?"":calibAlertaHTML(v.id)) : "";
+  const bp=$("#ab-box-painel"); if(bp) bp.style.display=abExigePainel()?"":"none";
 }
 
 function setAbastTipo(t){
@@ -2348,6 +2896,7 @@ function setAbastTipo(t){
   if(boxV) boxV.style.display = isG?"none":"";
   if(boxG) boxG.style.display = isG?"":"none";
   if(boxT) boxT.style.display = isG?"none":"";
+  const bp=$("#ab-box-painel"); if(bp) bp.style.display = abExigePainel()?"":"none";
   const sel=$("#ab-comb");
   if(sel){
     const atual=sel.value;
@@ -2380,8 +2929,18 @@ async function saveAbastecimento(){
   const litros=+g("litros")||0, vl=+g("vl")||0;
   const unidade=unidadeComb(g("comb"));
   if(!litros){toast("Informe a quantidade ("+unidade+")");return;}
-  const id=uid("ab"); let cupomRef=null;
+  const vSel=tipo==="veiculo"?veiculo(g("veic")):null;
+  const semKm=tipo==="gerador"||ehGerador(vSel);
+  if(!semKm){
+    if(g("km")===""){ alert("Informe a quilometragem do veículo. Abastecimento sem KM não é permitido."); return; }
+    const erro=validarKm(vSel.id, g("km"));
+    if(erro){ alert(erro); return; }
+  }
+  if(abExigePainel() && !window._painel){ alert("Tire a foto do PAINEL do veículo mostrando a quilometragem. Ela é obrigatória no abastecimento."); return; }
+  const id=uid("ab"); let cupomRef=null, painelRef=null;
+  if(window._painel && abExigePainel()){ painelRef=await photoPut(id+"_painel", window._painel); }
   if(window._cupom){ cupomRef=await photoPut(id+"_cupom", window._cupom); }
+  if(apiConfigurada() && painelRef && !/^https?:\/\//.test(painelRef)){ toast("⚠ A foto do painel não subiu à nuvem — ficou no aparelho"); }
   if(apiConfigurada() && window._cupom && cupomRef && !/^https?:\/\//.test(cupomRef)){
     toast("⚠ A foto do cupom não subiu à nuvem — ficou no aparelho");
   }
@@ -2393,15 +2952,17 @@ async function saveAbastecimento(){
     data:g("data")?new Date(g("data")).toISOString():nowISO(),
     km: tipo==="veiculo"?(+g("km")||0):0,
     posto:g("posto"),combustivel:g("comb"),litros,unidade,valorLitro:vl,total:litros*vl,
-    tanqueCheio: tipo==="veiculo"?window._tanque:false,cupom:cupomRef};
+    tanqueCheio: tipo==="veiculo"?window._tanque:false,cupom:cupomRef,fotoPainel:painelRef,
+    placa: vSel?vSel.placa:"", veiculoInterno: vSel?vSel.interno:"", obs:g("obs").trim(),
+    registradoPor:SESSION.nome, registradoPorId:SESSION.id};
   DB.abastecimentos.push(reg);
-  let alvo="Gerador "+reg.gerador, abas=["abastecimentos"];
-  if(tipo==="veiculo"){
-    const v=veiculo(g("veic"));
-    if(v){ if(g("km")&&+g("km")>v.km) v.km=+g("km"); alvo=v.interno; abas=["abastecimentos","veiculos"]; }
+  let alvo="Gerador "+reg.gerador, abas=["abastecimentos","auditoria"];
+  if(tipo==="veiculo" && vSel){
+    if(reg.km>(+vSel.km||0)){ vSel.km=reg.km; vSel.kmEm=reg.data; }
+    alvo=vSel.interno; abas.push("veiculos");
   }
-  log("Registrou abastecimento",alvo+" "+litros+unidade);
-  window._cupom=null;saveSync(abas);closeModal();toast("Abastecimento registrado");
+  log("Registrou abastecimento",alvo+" "+litros+unidade+(reg.km?" · KM "+fmtNum(reg.km):""));
+  window._cupom=null;window._painel=null;saveSync(abas);closeModal();toast("Abastecimento registrado");
   go(SESSION.tipo==="motorista"?"mot-abast":"abastecimentos");
 }
 
@@ -2422,7 +2983,7 @@ function formManutencao(){
   const vs=DB.veiculos;
   openModal("Registrar manutenção",`
     <label>Veículo</label><select id="mn-veic"><option value="">Selecione</option>${vs.map(v=>`<option value="${v.id}">${esc(v.interno)} · ${esc(v.placa)}</option>`).join("")}</select>
-    <div class="two"><div><label>Data</label><input id="mn-data" type="date" value="${new Date().toISOString().slice(0,10)}"></div>
+    <div class="two"><div><label>Data</label><input id="mn-data" type="date" value="${localD()}"></div>
       <div><label>KM</label><input id="mn-km" type="number"></div></div>
     <label>Tipo</label><select id="mn-tipo">${["Óleo","Filtro","Pneus","Freios","Bateria","Suspensão","Motor","Elétrica","Revisão","Outro"].map(o=>`<option>${o}</option>`).join("")}</select>
     <label>Descrição</label><textarea id="mn-desc"></textarea>
@@ -2438,14 +2999,85 @@ function formManutencao(){
 async function saveManutencao(){
   const g=k=>$("#mn-"+k).value;
   if(!g("veic")){toast("Selecione o veículo");return;}
+  if(g("km")!==""){ const erro=validarKm(g("veic"),g("km")); if(erro){ alert(erro); return; } }
   const id=uid("mn"); let foto=null;
   if(window._mnfoto){ foto=await photoPut(id+"_f", window._mnfoto); }
-  DB.manutencoes.push({id,veiculoId:g("veic"),data:g("data")?new Date(g("data")).toISOString():nowISO(),
+  DB.manutencoes.push({id,veiculoId:g("veic"),data:dataInputISO(g("data")),registradoPor:SESSION.nome,
     km:+g("km")||0,tipo:g("tipo"),descricao:g("desc"),oficina:g("oficina"),valor:+g("valor")||0,
-    nf:g("nf"),proximaData:g("proxdata")?new Date(g("proxdata")).toISOString():"",proximoKm:+g("proxkm")||0,foto});
+    nf:g("nf"),proximaData:g("proxdata")?dataInputISO(g("proxdata")):"",proximoKm:+g("proxkm")||0,foto});
   const v=veiculo(g("veic"));
+  if(+g("km")>(+v.km||0)){ v.km=+g("km"); v.kmEm=nowISO(); }
   log("Registrou manutenção",v.interno+" "+g("tipo"));
-  window._mnfoto=null;saveSync(["manutencoes","veiculos"]);closeModal();toast("Manutenção registrada");go("manutencao");
+  window._mnfoto=null;saveSync(["manutencoes","veiculos","auditoria"]);closeModal();toast("Manutenção registrada");go("manutencao");
+}
+
+/* ============ CALIBRAGEM DOS PNEUS ============ */
+ROUTES.calibragem=(el)=>{
+  const ordem={sem:0,atrasada:1,hoje:2,prox:3,ok:4};
+  const arr=DB.veiculos.filter(v=>!ehGerador(v)).map(v=>({v,c:calibStatus(v.id)}))
+    .sort((a,b)=>(ordem[a.c.nivel]-ordem[b.c.nivel])||(a.v.interno||"").localeCompare(b.v.interno||"","pt-BR"));
+  const cont=n=>arr.filter(x=>n.includes(x.c.nivel)).length;
+  el.innerHTML=`<div class="wrap"><h2 class="page-title">🛞 Calibragem dos pneus <small>1 vez por semana, por veículo</small></h2>
+    <div class="grid g4" style="margin-bottom:14px">
+      ${stat("🔴","Atrasadas / hoje",cont(["sem","atrasada","hoje"]),"red")}
+      ${stat("🟡","Próximas",cont(["prox"]),"orange")}
+      ${stat("🟢","Em dia",cont(["ok"]),"green")}
+    </div>
+    <button class="btn" style="margin-bottom:14px" onclick="formCalibragem()">＋ 🛞 Registrar calibragem</button>
+    <div class="list">${arr.map(({v,c})=>`<div class="row-item ${c.cor==="red"?"calib-atrasada":""}">
+      <div class="av">${v.tipo==="Moto"?"🏍️":esc(v.interno.replace("V-",""))}</div>
+      <div class="main" onclick="go('veiculo-det','${v.id}')" style="cursor:pointer"><div class="t">${esc(v.interno)} · ${esc(v.placa)}</div>
+        <div class="s">${c.ultima?"Última: "+dBR(c.ultima.data)+" · "+esc(c.ultima.responsavelNome||"—")+" · Próxima: <b>"+dBR(c.proxima)+"</b>":"Nenhuma calibragem registrada"}</div>
+        <div class="s">${calibTag(v.id)}</div></div>
+      <button class="btn sm" style="width:auto" onclick="formCalibragem('${v.id}')">Registrar</button></div>`).join("")}</div>
+  </div>`;
+};
+function formCalibragem(vid){
+  closeModal();
+  const vs=DB.veiculos.filter(v=>!ehGerador(v)), ms=DB.motoristas.filter(m=>m.status==="Ativo");
+  const motDefault=SESSION.tipo==="motorista"?SESSION.id:"";
+  if(!vid && SESSION.tipo==="motorista") vid=DB.retiradas.find(r=>!r.devolvida&&r.motoristaId===SESSION.id)?.veiculoId||"";
+  openModal("Registrar calibragem dos pneus",`
+    <label>Veículo</label><select id="cb-veic" onchange="cbVeicMudou()"><option value="">Selecione</option>${vs.map(v=>`<option value="${v.id}" ${v.id===vid?"selected":""}>${esc(v.interno)} · ${esc(v.placa)}</option>`).join("")}</select>
+    <div id="cb-info" class="hint"></div>
+    <div class="two"><div><label>Data e hora</label><input id="cb-data" type="datetime-local" value="${localDT()}"></div>
+      <div><label>KM na calibragem</label><input id="cb-km" type="number" inputmode="numeric"></div></div>
+    <label>Responsável</label><select id="cb-resp"><option value="">Selecione</option>${ms.map(m=>`<option value="${m.id}" ${m.id===motDefault?"selected":""}>${esc(m.nome)}</option>`).join("")}</select>
+    <label>Observações (opcional)</label><textarea id="cb-obs" placeholder="Ex.: pressão 32 psi, estepe conferido"></textarea>
+    <div class="hint">A próxima calibragem é calculada automaticamente: <b>data desta calibragem + 7 dias</b>.</div>
+    <div class="wizard-nav"><button class="btn sec" onclick="closeModal()">Cancelar</button>
+      <button class="btn" onclick="salvarComBotao(this, saveCalibragem)">Salvar</button></div>`);
+  cbVeicMudou();
+}
+function cbVeicMudou(){
+  const v=veiculo(($("#cb-veic")||{}).value), info=$("#cb-info"), km=$("#cb-km");
+  if(!info) return;
+  if(!v){ info.innerHTML=""; return; }
+  const c=calibStatus(v.id);
+  info.innerHTML=`KM atual: <b>${fmtKm(kmAtual(v.id))}</b> · ${calibTag(v.id)}${c.ultima?" · última "+dBR(c.ultima.data):""}`;
+  if(km && !km.value) km.value=kmAtual(v.id)||"";
+}
+async function saveCalibragem(){
+  const g=k=>{const e=$("#cb-"+k);return e?e.value:"";};
+  const v=veiculo(g("veic"));
+  if(!v){ toast("Selecione o veículo"); return; }
+  if(!g("resp")){ toast("Selecione o responsável"); return; }
+  if(g("km")!==""){ const erro=validarKm(v.id,g("km")); if(erro){ alert(erro); return; } }
+  const data=g("data")?new Date(g("data")).toISOString():nowISO();
+  if(new Date(data)>new Date(Date.now()+5*60000)){ alert("A data da calibragem não pode estar no futuro."); return; }
+  const resp=motorista(g("resp"));
+  const reg={id:uid("cal"),veiculoId:v.id,placa:v.placa,veiculoInterno:v.interno,data,
+    km:+g("km")||0,responsavelId:resp?.id||"",responsavelNome:resp?.nome||"",
+    obs:g("obs").trim(),registradoPor:SESSION.nome,registradoPorId:SESSION.id};
+  const prox=new Date(data); prox.setHours(0,0,0,0); prox.setDate(prox.getDate()+CALIB_DIAS);
+  reg.proxima=prox.toISOString();
+  DB.calibragens.push(reg);
+  if(reg.km>(+v.km||0)){ v.km=reg.km; v.kmEm=data; }
+  log("Registrou calibragem",v.interno+" · próxima "+dBR(prox));
+  saveSync(["calibragens","veiculos","auditoria"]);
+  closeModal(); toast("Calibragem registrada — próxima em "+dBR(prox));
+  if(CURRENT==="veiculo-det") go("veiculo-det",v.id);
+  else if(["calibragem","mot-home","veiculos","dashboard"].includes(CURRENT)) go(CURRENT);
 }
 
 /* ============ OCORRÊNCIAS ============ */
@@ -2476,7 +3108,7 @@ function formOcorrencia(){
     <label>Tipo</label><select id="o-tipo">${["Acidente","Avaria","Pane","Multa","Problema mecânico","Falta de combustível","Problema operacional","Outro"].map(o=>`<option>${o}</option>`).join("")}</select>
     <label>Veículo</label><select id="o-veic"><option value="">Selecione</option>${vs.map(v=>`<option value="${v.id}">${esc(v.interno)} · ${esc(v.placa)}</option>`).join("")}</select>
     <label>Motorista</label><select id="o-mot"><option value="">Selecione</option>${ms.map(m=>`<option value="${m.id}" ${m.id===motDefault?"selected":""}>${esc(m.nome)}</option>`).join("")}</select>
-    <div class="two"><div><label>Data/Hora</label><input id="o-data" type="datetime-local" value="${new Date().toISOString().slice(0,16)}"></div>
+    <div class="two"><div><label>Data/Hora</label><input id="o-data" type="datetime-local" value="${localDT()}"></div>
       <div><label>Local</label><input id="o-local"></div></div>
     <label>Descrição</label><textarea id="o-desc"></textarea>
     <label>Foto</label>${photoSlotHTML("ofoto","Foto da ocorrência","📸")}
@@ -2492,7 +3124,7 @@ async function saveOcorrencia(){
   DB.ocorrencias.push({id,tipo:g("tipo"),veiculoId:g("veic"),motoristaId:g("mot"),
     data:g("data")?new Date(g("data")).toISOString():nowISO(),local:g("local"),descricao:g("desc"),status:"Aberta",fotos});
   log("Registrou ocorrência",g("tipo"));
-  window._ofoto=null;saveSync(["ocorrencias"]);closeModal();toast("Ocorrência registrada");
+  window._ofoto=null;saveSync(["ocorrencias","auditoria"]);closeModal();toast("Ocorrência registrada");
   if(CURRENT==="ocorrencias")go("ocorrencias");else if(CURRENT==="mot-home")go("mot-home");
 }
 async function verOcorrencia(id){
@@ -2599,8 +3231,22 @@ ROUTES.comparar=(el)=>{
 };
 
 /* ============ ALERTAS ============ */
-function computeAlertas(){
+function computeAlertas(resumo){
   const al=[];
+  DB.veiculos.forEach(v=>{
+    const n=retiradasAbertas(v.id).length;
+    if(n>1) al.push({level:"red",em:"⚠️",t:"Veículo com "+n+" retiradas abertas",s:v.interno+" · "+v.placa+" · registre a entrega de cada uma (Devolver viatura)"});
+  });
+  if(resumo){
+    const cs=DB.veiculos.filter(v=>!ehGerador(v)).map(v=>({v,c:calibStatus(v.id)}));
+    const red=cs.filter(x=>x.c.cor==="red"), yel=cs.filter(x=>x.c.nivel==="prox");
+    if(red.length) al.push({level:"red",em:"🛞",t:red.length+" veículo(s) com calibragem atrasada ou para hoje",s:red.slice(0,6).map(x=>x.v.interno).join(", ")+(red.length>6?"…":"")+" — veja em Calibragem"});
+    if(yel.length) al.push({level:"yellow",em:"🛞",t:yel.length+" calibragem(ns) próxima(s)",s:yel.map(x=>x.v.interno).join(", ")});
+  } else DB.veiculos.filter(v=>!ehGerador(v)).forEach(v=>{
+    const c=calibStatus(v.id);
+    if(c.nivel==="ok") return;
+    al.push({level:c.cor==="red"?"red":"yellow",em:"🛞",t:c.rotulo,s:v.interno+" · "+v.placa+(c.proxima?" · prevista "+dBR(c.proxima):" · nunca registrada")});
+  });
   DB.motoristas.forEach(m=>{
     if(!m.validadeCnh||m.status!=="Ativo")return;
     const days=Math.ceil((new Date(m.validadeCnh)-new Date())/86400000);
@@ -2764,12 +3410,14 @@ function gerarComprovantePDF(tipo,id){
     linhas=[["Tipo","Comprovante de Retirada"],["Motorista",m?.nome],["Veículo",v.interno+" · "+v.placa],
       ["Destino",reg.destinoNome],["Finalidade",reg.finalidade||"—"],["KM inicial",fmtNum(reg.kmInicial)],
       ["Combustível",reg.nivelComb||"—"],["Água",reg.niveisAgua],["Óleo",reg.niveisOleo],
-      ["Avarias",reg.avaria?.tem?"Sim":"Não"],["Data/Hora",dtBR(reg.data)],["Termo aceito por",reg.termoAceite?.nome||m?.nome]];
+      ["Avarias",reg.avaria?.tem?"Sim":"Não"],["Data/Hora",dtBR(reg.data)],["Termo aceito por",reg.termoAceite?.nome||m?.nome],
+      ["Registrado por",reg.registradoPor||reg.termoAceite?.usuario||"—"],["Observações",reg.obs||"—"]];
   }else{reg=DB.devolucoes.find(d=>d.id===id);v=veiculo(reg.veiculoId);m=motorista(reg.motoristaId);
     const r=DB.retiradas.find(x=>x.id===reg.retiradaId);
     linhas=[["Tipo","Comprovante de Devolução"],["Motorista",m?.nome],["Veículo",v.interno+" · "+v.placa],
       ["KM inicial",fmtNum(r?.kmInicial)],["KM final",fmtNum(reg.kmFinal)],["Percorrido",fmtNum(reg.kmPercorrido)+" km"],
-      ["Ocorrências",reg.ocorrencia?.tem?"Sim ("+reg.ocorrencia.tipo+")":"Não"],["Data/Hora",dtBR(reg.data)]];
+      ["Ocorrências",reg.ocorrencia?.tem?"Sim ("+reg.ocorrencia.tipo+")":"Não"],["Data/Hora",dtBR(reg.data)],
+      ["Responsável pela entrega",reg.registradoPor||reg.termo?.usuario||"—"],["Observações",reg.obs||"—"]];
   }
   doc.setFillColor(11,15,26);doc.rect(0,0,210,28,"F");
   doc.setTextColor(224,182,75);doc.setFontSize(18);doc.text("VEGAS FROTA",14,14);
