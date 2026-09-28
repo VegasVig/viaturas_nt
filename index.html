@@ -4,6 +4,13 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#0b0f1a">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" type="image/png" href="icon-192.png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Frota Niterói">
 <title>VEGAS FROTA NITERÓI — Controle de Frota</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <style>
@@ -3430,5 +3437,52 @@ function gerarComprovantePDF(tipo,id){
 }
 
 </script>
+
+<!-- ===== PWA: banner de instalação ===== -->
+<style>
+#pwa-banner{position:fixed;left:12px;right:12px;bottom:calc(12px + env(safe-area-inset-bottom,0px));z-index:9999;
+  background:var(--card2);border:1px solid var(--gold2);border-radius:var(--r);box-shadow:var(--shadow);
+  padding:14px;display:none;align-items:center;gap:12px;max-width:520px;margin:0 auto}
+#pwa-banner img{width:48px;height:48px;border-radius:12px;flex:none}
+#pwa-banner .t{flex:1;min-width:0}
+#pwa-banner b{display:block;color:var(--gold);font-size:15px}
+#pwa-banner span{font-size:13px;color:var(--muted)}
+#pwa-banner .bt{display:flex;flex-direction:column;gap:6px}
+#pwa-banner button{border:0;border-radius:10px;padding:9px 14px;font-weight:700;font-size:14px}
+#pwa-instalar{background:var(--gold);color:#111}
+#pwa-fechar{background:transparent;color:var(--muted2)}
+</style>
+<div id="pwa-banner">
+  <img src="icon-192.png" alt="">
+  <div class="t"><b>Instalar Frota Niterói</b><span id="pwa-msg">Use como aplicativo, direto da tela inicial.</span></div>
+  <div class="bt"><button id="pwa-instalar">Instalar</button><button id="pwa-fechar">Agora não</button></div>
+</div>
+<script>
+(function(){
+  if('serviceWorker' in navigator){
+    window.addEventListener('load',()=>navigator.serviceWorker.register('sw.js').catch(()=>{}));
+  }
+  const jaApp = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone;
+  if(jaApp) return;
+  const KEY='pwa-dispensado-niteroi', DIAS=3;
+  try{ const t=+localStorage.getItem(KEY)||0; if(Date.now()-t < DIAS*864e5) return; }catch(e){}
+  const bn=document.getElementById('pwa-banner'), btI=document.getElementById('pwa-instalar'),
+        btF=document.getElementById('pwa-fechar'), msg=document.getElementById('pwa-msg');
+  let evento=null;
+  btF.onclick=()=>{ bn.style.display='none'; try{localStorage.setItem(KEY,Date.now())}catch(e){} };
+  window.addEventListener('beforeinstallprompt',e=>{ e.preventDefault(); evento=e; bn.style.display='flex'; });
+  btI.onclick=async()=>{
+    if(evento){ evento.prompt(); const r=await evento.userChoice; evento=null; bn.style.display='none';
+      if(r.outcome!=='accepted'){ try{localStorage.setItem(KEY,Date.now())}catch(e){} } }
+    else { btF.click(); }
+  };
+  window.addEventListener('appinstalled',()=>{ bn.style.display='none'; });
+  // iPhone/iPad não tem botão automático: mostra a instrução
+  const ios=/iphone|ipad|ipod/i.test(navigator.userAgent);
+  if(ios){ msg.innerHTML='Toque em <b style="display:inline;color:var(--gold)">Compartilhar ⬆️</b> e depois em <b style="display:inline;color:var(--gold)">Adicionar à Tela de Início</b>.';
+    btI.textContent='Entendi'; setTimeout(()=>bn.style.display='flex',1500); }
+})();
+</script>
 </body>
+</html>
 </html>
