@@ -547,7 +547,7 @@ const API_URL_PADRAO = "https://script.google.com/macros/s/AKfycbxPiQvEQjUxWjZ1m
     if(!dbVelho && !urlVelha) return;
     const txt=(dbVelho||"")+" "+urlVelha;
     const deNiteroi=/AKfycbxPiQvEQjUxWjZ1mYrALKAOxHUbFUAFe2QFKqsuB67olUvMLHXUCwpstOHF5yQ6bSmR|GKG0C57|RFD3B47|Antonio Carlos|Jhonatan Pessanha/.test(txt);
-    const deVR=/AKfycbw7Fven1E1nYcX1fdbxytGl8JAhAlQbueFzEPBvCRaLcXhUz45CmKsSSYHyUSLuYuCw|"placa":"FKD"|Adriano Dias|Genivaldo/.test(txt);
+    const deVR=/AKfycbw7Fven1E1nYcX1fdbxytGl8JAhAlQbueFzEPBvCRaLcXhUz45CmKsSSYHyUSLuYuCw|AKfycbwWEkmGph9jhkJpTbor1V1vkEa5WAidl7T3ug8SKrRk01LShLbRp38d336UBRYkQTWQ|"placa":"FKD"|Adriano Dias|Genivaldo/.test(txt);
     if(!deNiteroi || deVR) return;                               // não é (só) de Niterói: não mexe
     ["db_v1","fila_sync","sync_hash","wizard_draft","api_url"].forEach(k=>{
       const v=localStorage.getItem("vegasfrota_"+k);
@@ -620,6 +620,8 @@ function traduzErroServidor(e){
   if(/KM_INVALIDO/.test(e)) return "quilometragem menor que a última registrada";
   if(/JA_BAIXADA/.test(e)) return "este veículo já teve baixa administrativa registrada";
   if(/JA_DEVOLVIDA/.test(e)) return "a entrega deste veículo já foi registrada";
+  if(/aba inv[aá]lida/.test(e)) return "o servidor (Apps Script) está DESATUALIZADO e não conhece a tabela “"+e.split(":").pop().trim()+"”. Publique a versão 6 do backend (Implantar → Gerenciar implantações → Nova versão)";
+  if(/a[cç][aã]o desconhecida/i.test(e)) return "o servidor (Apps Script) está DESATUALIZADO para esta função. Publique a versão 6 do backend";
   return e;
 }
 /* true quando o erro foi de rede (sem internet / tempo esgotado), e não uma
@@ -634,7 +636,7 @@ async function apiPing(){ return api("ping"); }
 
 /* Todas as tabelas do banco (a ordem não importa). */
 const TABELAS=["usuarios","motoristas","veiculos","destinos","retiradas","devolucoes",
-  "abastecimentos","manutencoes","ocorrencias","calibragens","baixas","auditoria"];
+  "abastecimentos","manutencoes","ocorrencias","calibragens","baixas","auditoria","config","alertas"];
 const TABELAS_SEED=()=>({usuarios:SEED_USUARIOS,motoristas:SEED_MOTORISTAS,veiculos:SEED_VEICULOS,destinos:SEED_DESTINOS});
 let ULTIMO_PULL=0;
 
@@ -645,6 +647,14 @@ let ULTIMO_PULL=0;
    "sumia" e veículos retirados voltavam a aparecer como disponíveis.
    Agora nenhum registro local pendente é descartado, em nenhuma tabela. */
 let PULL_PROMISE=null;
+/* CORREÇÃO (nomes duplicados): um registro da lista inicial que nunca foi
+   alterado NÃO é edição local — não pode ser reenviado para a planilha.
+   Era isso que recriava cada técnico com um segundo id. Se a planilha
+   estiver vazia, a lista inicial continua sendo enviada (nuvemSemear). */
+function seedIntocado(aba,r){
+  const s=(TABELAS_SEED()[aba]||[]).find(x=>String(x.id)===String(r.id));
+  return !!s && hashReg(s)===hashReg(r);
+}
 /* v6: sincronização INCREMENTAL. O aparelho guarda o horário do servidor da
    última sincronização e pede só o que mudou desde então (antes baixava o
    banco inteiro a cada 45 s em cada celular — vários MB por vez). */
@@ -659,7 +669,7 @@ function nuvemPull(opts){
     const hashes=syncHashes();
     const pend={};
     TABELAS.forEach(aba=>{
-      pend[aba]=(DB[aba]||[]).filter(r=>r && r.id!=null && hashes[aba]?.[r.id]!==hashReg(r));
+      pend[aba]=(DB[aba]||[]).filter(r=>r && r.id!=null && hashes[aba]?.[r.id]!==hashReg(r) && !seedIntocado(aba,r));
     });
     const cursor=+localStorage.getItem(PULL_CURSOR_KEY)||0;
     const desde=(opts&&opts.completo)||!cursor ? 0 : Math.max(1,cursor-120000);   // 2 min de folga
@@ -701,11 +711,17 @@ function nuvemPull(opts){
             devolucaoId:loc.devolucaoId||r.devolucaoId, devolvidaEm:loc.devolvidaEm||r.devolvidaEm});
         } else if(aba==="veiculos"){
           const m=Object.assign({},r,loc);
-          const correcaoLocal=loc.kmCorrigidoEm && loc.kmCorrigidoEm!==r.kmCorrigidoEm;
-          if(!correcaoLocal && (+r.km||0)>(+loc.km||0)){ m.km=r.km; m.kmEm=r.kmEm; }
+          const tL=tms(loc.kmCorrigidoEm), tR=tms(r.kmCorrigidoEm);
+          if(tR>tL){ m.km=r.km; m.kmEm=r.kmEm; m.kmCorrigidoEm=r.kmCorrigidoEm; m.kmCorrigidoValor=r.kmCorrigidoValor; }   // correção feita em outro aparelho
+          else if(tL<=tR && (+r.km||0)>(+loc.km||0)){ m.km=r.km; m.kmEm=r.kmEm; }
           arr[i]=m;
         } else {
           arr[i]=loc;                       // edição local ainda não enviada vence
+        }
+        // KM corrigido pelo gestor em outro aparelho não volta ao valor errado
+        const ck=CAMPO_KM_ABA[aba];
+        if(ck && (r.correcoesKm||[]).length>(loc.correcoesKm||[]).length){
+          const m=arr[i]; [ck,"kmInicial","kmPercorrido"].forEach(k=>{ if(r[k]!==undefined) m[k]=r[k]; }); m.correcoesKm=r.correcoesKm;
         }
         reenviar.add(aba);
       });
@@ -727,6 +743,11 @@ function nuvemPull(opts){
     return DB;
   })();
   PULL_PROMISE.finally(()=>{ PULL_PROMISE=null; }).catch(()=>{});
+  // só depois de sincronizar com sucesso (e fora do pull, para não esperar a si mesmo):
+  // se a planilha tiver nomes repetidos, unifica automaticamente
+  PULL_PROMISE.then(()=>{
+    if(podeCorrigirCadastro() && temMotoristasDuplicados()) setTimeout(()=>deduplicarMotoristas(true).catch(e=>console.warn("dedup:",e)),300);
+  }).catch(()=>{});
   return PULL_PROMISE;
 }
 /* Atualiza da nuvem antes de uma ação crítica. Se não houver internet,
@@ -788,7 +809,8 @@ async function filaSincronizar(){
   const restantes=[];
   try{
     for(const item of mapa.values()){
-      try{ await api("push",{aba:item.aba,registro:limparRegistro(item.registro)}); marcarSync(item.aba,[item.registro]); }
+      try{ const res=await api("push",{aba:item.aba,registro:limparRegistro(item.registro)}); marcarSync(item.aba,[item.registro]);
+        if(res&&res.registro) adotarDoServidor([{aba:item.aba,registro:res.registro}]); }
       catch(e){ restantes.push(item); }
     }
   } finally { FILA_RODANDO=false; }
@@ -828,6 +850,17 @@ function hashReg(r){
   for(let i=0;i<t.length;i++){ h=((h<<5)-h+t.charCodeAt(i))|0; }
   return h+":"+t.length;
 }
+function adotarDoServidor(lista){
+  let alterou=false;
+  (lista||[]).forEach(it=>{
+    const reg=it&&it.registro, aba=it&&it.aba;
+    if(!reg||reg.id==null||!Array.isArray(DB[aba])) return;
+    const i=DB[aba].findIndex(x=>String(x.id)===String(reg.id));
+    if(i>=0) DB[aba][i]=reg; else DB[aba].push(reg);
+    marcarSync(aba,[reg]); alterou=true;
+  });
+  if(alterou) save();
+}
 function marcarSync(aba,regs){
   const hs=syncHashes(); hs[aba]=hs[aba]||{};
   regs.forEach(r=>{ if(r && r.id!=null) hs[aba][r.id]=hashReg(r); });
@@ -854,12 +887,20 @@ async function nuvemPushTabela(aba){
     for(let i=0;i<dados.length;i+=20){
       const lote=dados.slice(i,i+20);
       try{
-        await api("pushMuitos",{itens:lote.map(r=>({aba,registro:r}))});
+        const res=await api("pushMuitos",{itens:lote.map(r=>({aba,registro:r}))});
         marcarSync(aba,lote);
+        adotarDoServidor(res&&res.diferentes);
       }catch(e){
         console.warn("push tabela falhou",aba,e.message);
         lote.forEach(r=>filaAdd(aba,r));   // não perde: tenta de novo depois
-        if(!erroDeRede(e)) toast("⚠ Servidor recusou um envio: "+(e.amigavel||e.message),"erro");
+        if(!erroDeRede(e)){
+          // avisa com clareza, sem repetir o mesmo aviso a cada tentativa automática
+          const msg=e.amigavel||e.message, ag=Date.now();
+          if(msg!==window._ultAvisoSrvMsg || ag-(window._ultAvisoSrvEm||0)>600000){
+            window._ultAvisoSrvMsg=msg; window._ultAvisoSrvEm=ag;
+            toast("⚠ Não foi possível enviar ao servidor: "+msg+". Nada foi perdido — os dados ficaram guardados neste aparelho.","erro");
+          }
+        }
       }
     }
   } finally {
@@ -877,7 +918,7 @@ window.addEventListener("offline",()=>atualizarSyncPill());
    da frota na nuvem e redesenha as telas de consulta. Antes o app só
    baixava dados no login — um celular aberto há horas mostrava veículos
    já retirados como disponíveis. Não interrompe formulários nem o assistente. */
-const TELAS_ATUALIZAVEIS=["dashboard","veiculos","veiculo-det","mot-home","mot-devolver","map","calibragem","alertas","abastecimentos","mot-abast","mot-hist","motoristas","baixas","motorista-det"];
+const TELAS_ATUALIZAVEIS=["preventiva","dashboard","veiculos","veiculo-det","mot-home","mot-devolver","map","calibragem","alertas","abastecimentos","mot-abast","mot-hist","motoristas","baixas","motorista-det"];
 let ARG_ATUAL=null;
 async function atualizarTela(forcar){
   if(!SESSION || !apiConfigurada() || document.hidden) return;
@@ -1059,7 +1100,7 @@ function toast(msg,tipo){ let t=$(".toast"); if(!t){t=document.createElement("di
   msg=String(msg==null?"":msg);
   if(!tipo) tipo = /^⚠/.test(msg)?"aviso" : (/não consegui|falhou|erro|recusou/i.test(msg)?"erro" : (/✓|salv|registrad|criad|atualizad|gerad|exportad|conectad/i.test(msg)?"ok":""));
   t.className="toast"+(tipo?" "+tipo:""); t.textContent=msg; void t.offsetWidth; t.classList.add("show");
-  clearTimeout(t._t); t._t=setTimeout(()=>t.classList.remove("show"), tipo==="erro"?5200:(msg.length>60?3600:2400));}
+  clearTimeout(t._t); t._t=setTimeout(()=>t.classList.remove("show"), tipo==="erro"?Math.max(5200,msg.length*55):(msg.length>60?3600:2400));}
 
 /* Executa uma ação de salvar mostrando "Salvando..." e BLOQUEANDO o botão
    enquanto processa — evita o clique duplo que gravava o registro 2x. */
@@ -1172,7 +1213,7 @@ function preencherMotoristas(){
   const sel=$("#mot-select"); if(!sel) return;
   const atual=sel.value;
   sel.innerHTML='<option value="">Selecione seu nome...</option>'+
-    DB.motoristas.filter(m=>m.status==="Ativo").slice().sort((a,b)=>(a.nome||"").localeCompare(b.nome||"","pt-BR"))
+    semNomesRepetidos(DB.motoristas.filter(m=>m.status==="Ativo")).sort((a,b)=>(a.nome||"").localeCompare(b.nome||"","pt-BR"))
       .map(m=>`<option value="${m.id}">${esc(m.nome)}</option>`).join("");
   if(atual) sel.value=atual;
 }
@@ -1195,6 +1236,7 @@ function enterApp(){
   if(apiConfigurada() && SESSION.tipo==="motorista" && !SESSION.token) renovarSessao().catch(()=>{});
   // ao abrir (inclusive depois de atualizar a página) busca o estado atual da frota
   if(apiConfigurada()) setTimeout(()=>{ atualizarTela(true); enviarFotosPendentes(); },50);
+  else if(podeCorrigirCadastro() && temMotoristasDuplicados()) setTimeout(()=>deduplicarMotoristas(true),300);
 }
 
 /* ---------- NAVEGAÇÃO ---------- */
@@ -1258,6 +1300,7 @@ function openMoreMenu(){
     {id:"destinos",ic:"📍",t:"Destinos"},
     {id:"abastecimentos",ic:"⛽",t:"Abastecimentos"},
     {id:"calibragem",ic:"🛞",t:"Calibragem dos pneus"},
+    {id:"preventiva",ic:"🛠️",t:"Manutenção preventiva",s:(typeof mntResumoMenu==="function"?mntResumoMenu():"Óleo, correia/corrente e pneus por KM")},
     {id:"manutencao",ic:"🔧",t:"Manutenção"},
     {id:"ocorrencias",ic:"⚠️",t:"Ocorrências"},
     {id:"baixas",ic:"🧾",t:"Baixa de veículo não entregue",s:entregasPendentes().length?entregasPendentes().length+" entrega(s) pendente(s)":"Pendências e histórico de baixas"},
@@ -1470,6 +1513,22 @@ function retiradasAbertas(vid){
     .sort((a,b)=>new Date(b.data)-new Date(a.data));
 }
 function retiradaAberta(vid){ return retiradasAbertas(vid)[0]; }
+/* A retirada é do usuário logado? Compara pelo id e, quando o id não bate,
+   pelo NOME. Retiradas que o gestor registrou para um motorista num aparelho
+   com a lista antiga (nomes duplicados) ficaram com o id de um cadastro que já
+   foi unificado — o motorista não via a viatura em "Devolver" e não conseguia
+   dar baixa. Agora ele vê e consegue devolver. */
+function retiradaDoUsuario(r){
+  if(!r || !SESSION) return false;
+  if(String(r.motoristaId)===String(SESSION.id)) return true;
+  if(SESSION.tipo!=="motorista") return false;
+  const nome=motorista(r.motoristaId)?.nome || r.motoristaNome || "";
+  return !!nome && chaveNome(nome)===chaveNome(SESSION.nome);
+}
+/* Campo de KM de cada tabela (usado na correção de KM pelo gestor). */
+const CAMPO_KM_ABA={retiradas:"kmInicial",devolucoes:"kmFinal",abastecimentos:"km",manutencoes:"km",calibragens:"km"};
+const ROTULO_KM_ABA={retiradas:"KM da retirada",devolucoes:"KM da entrega",abastecimentos:"KM do abastecimento",manutencoes:"KM da manutenção",calibragens:"KM da calibragem"};
+function tms(iso){ return iso?(new Date(iso).getTime()||0):0; }
 const STATUS_MANUAIS=["Manutenção","Indisponível","Reservado"];
 /* Em uso = existe retirada aberta. Senão vale o status manual
    (Manutenção/Indisponível/Reservado). Senão, Disponível. */
@@ -1484,11 +1543,11 @@ function veiculoDisponivel(v){ return statusVeiculo(v)==="Disponível"; }
 function kmLeituras(vid){
   const out=[];
   const nomeM=(id,nome)=>nome||motorista(id)?.nome||"—";
-  DB.retiradas.filter(r=>r.veiculoId===vid).forEach(r=>out.push({data:r.data,evento:"Retirada",km:+r.kmInicial||0,motorista:nomeM(r.motoristaId,r.motoristaNome),ref:r.id}));
-  DB.devolucoes.filter(d=>d.veiculoId===vid).forEach(d=>out.push({data:d.data,evento:d.automatica?"Entrega (automática)":"Entrega",km:+d.kmFinal||0,motorista:nomeM(d.motoristaId,d.motoristaNome),ref:d.id}));
-  DB.abastecimentos.filter(a=>a.veiculoId===vid && a.tipo!=="gerador" && +a.km>0).forEach(a=>out.push({data:a.data,evento:"Abastecimento",km:+a.km,motorista:nomeM(a.motoristaId),ref:a.id}));
-  DB.manutencoes.filter(m=>m.veiculoId===vid && +m.km>0).forEach(m=>out.push({data:m.data,evento:"Manutenção — "+(m.tipo||""),km:+m.km,motorista:"—",ref:m.id}));
-  (DB.calibragens||[]).filter(c=>c.veiculoId===vid && +c.km>0).forEach(c=>out.push({data:c.data,evento:"Calibragem",km:+c.km,motorista:c.responsavelNome||"—",ref:c.id}));
+  DB.retiradas.filter(r=>r.veiculoId===vid).forEach(r=>out.push({data:r.data,evento:"Retirada",km:+r.kmInicial||0,motorista:nomeM(r.motoristaId,r.motoristaNome),ref:r.id,aba:"retiradas",corrigido:!!(r.correcoesKm&&r.correcoesKm.length)}));
+  DB.devolucoes.filter(d=>d.veiculoId===vid).forEach(d=>out.push({data:d.data,evento:d.automatica?"Entrega (automática)":"Entrega",km:+d.kmFinal||0,motorista:nomeM(d.motoristaId,d.motoristaNome),ref:d.id,aba:"devolucoes",corrigido:!!(d.correcoesKm&&d.correcoesKm.some(c=>c.campo==="kmFinal"))}));
+  DB.abastecimentos.filter(a=>a.veiculoId===vid && a.tipo!=="gerador" && +a.km>0).forEach(a=>out.push({data:a.data,evento:"Abastecimento",km:+a.km,motorista:nomeM(a.motoristaId),ref:a.id,aba:"abastecimentos",corrigido:!!(a.correcoesKm&&a.correcoesKm.length)}));
+  DB.manutencoes.filter(m=>m.veiculoId===vid && +m.km>0 && !m.excluido && !m.kmNaoConta).forEach(m=>out.push({data:m.data,evento:"Manutenção — "+(m.tipo||""),km:+m.km,motorista:"—",ref:m.id,aba:"manutencoes",corrigido:!!(m.correcoesKm&&m.correcoesKm.length)}));
+  (DB.calibragens||[]).filter(c=>c.veiculoId===vid && +c.km>0).forEach(c=>out.push({data:c.data,evento:"Calibragem",km:+c.km,motorista:c.responsavelNome||"—",ref:c.id,aba:"calibragens",corrigido:!!(c.correcoesKm&&c.correcoesKm.length)}));
   return out.sort((a,b)=>new Date(a.data)-new Date(b.data));
 }
 /* KM ATUAL = maior leitura registrada. Se o gestor corrigiu o KM
@@ -1665,6 +1724,7 @@ ROUTES.dashboard=(el)=>{
       ${stat("⚠️","Ocorrências abertas",occAbertas,"red")}
     </div>
 
+    ${typeof mntBlocoPainel==="function"?mntBlocoPainel():""}
     <div class="section-title">Veículos com cada motorista <span class="line"></span></div>
     <div style="margin-bottom:10px"><button class="btn ghost" style="width:auto;font-size:12px;padding:6px 12px" onclick="corrigirStatusFrota()">🔧 Corrigir status da frota</button></div>
     <div id="dash-uso"></div>
@@ -1728,7 +1788,7 @@ ROUTES.veiculos=(el)=>{
       <button class="btn sm" style="width:auto;white-space:nowrap" onclick="formVeiculo()">＋ Novo</button>
     </div>
     <div class="chips" id="v-chips">
-      ${["Todos","Disponível","Em uso","Manutenção","Indisponível","Calibragem atrasada"].map((s,i)=>`<button class="${i===0?'on':''}" data-f="${s}">${s}</button>`).join("")}
+      ${["Todos","Disponível","Em uso","Manutenção","Indisponível","Calibragem atrasada","Preventiva vencida"].map((s,i)=>`<button class="${i===0?'on':''}" data-f="${s}">${s}</button>`).join("")}
     </div>
     <div id="v-list" class="list"></div>
   </div>`;
@@ -1736,6 +1796,7 @@ ROUTES.veiculos=(el)=>{
   const render=()=>{
     let arr=DB.veiculos.slice();
     if(filt==="Calibragem atrasada") arr=arr.filter(v=>!ehGerador(v)&&calibAtrasada(v.id));
+    else if(filt==="Preventiva vencida") arr=arr.filter(v=>typeof mntSituacaoVeiculo==="function" && ["vencida","proxima"].includes(mntSituacaoVeiculo(v.id)));
     else if(filt!=="Todos") arr=arr.filter(v=>statusVeiculo(v)===filt);
     if(q) arr=arr.filter(v=>(v.placa+v.interno+v.modelo+v.marca).toLowerCase().includes(q));
     $("#v-list").innerHTML = arr.length? arr.map(v=>{
@@ -1746,7 +1807,8 @@ ROUTES.veiculos=(el)=>{
         <div class="av">${v.tipo==="Moto"?"🏍️":esc(v.interno.replace("V-",""))}</div>
         <div class="main"><div class="t">${esc(v.interno)} · ${esc(v.placa)}</div>
           <div class="s">${esc([v.marca,v.modelo].filter(Boolean).join(" ")||v.tipo)}${m?" · 👨‍✈️ <b>"+esc(m.nome)+"</b>":(ult?" · último: "+esc(ult):"")} · ${fmtKm(kmAtual(v.id))}</div>
-          ${atr?`<div class="s" style="color:var(--red);font-weight:700">🛞 ${esc(calibStatus(v.id).rotulo)}</div>`:""}</div>
+          ${atr?`<div class="s" style="color:var(--red);font-weight:700">🛞 ${esc(calibStatus(v.id).rotulo)}</div>`:""}
+          ${typeof mntLinhaAviso==="function"?mntLinhaAviso(v.id):""}</div>
         <div class="act">${vStatusTag(statusVeiculo(v))}</div></div>`;
     }).join("") : `<div class="empty"><div class="em">🚗</div>Nenhum veículo</div>`;
   };
@@ -1791,21 +1853,22 @@ function saveVeiculo(id){
     if(kmInf<atual){
       if(SESSION.tipo==="motorista"){ alert(MSG_KM_INVALIDO); return; }
       if(!confirm("O KM informado ("+fmtNum(kmInf)+") é MENOR que o último registrado ("+fmtNum(atual)+").\n\nIsso só deve ser feito para corrigir erro de digitação. Confirmar a correção?")) return;
-      data.km=kmInf; data.kmCorrigidoEm=nowISO(); data.kmEm=data.kmCorrigidoEm;
+      data.km=kmInf; data.kmCorrigidoEm=nowISO(); data.kmEm=data.kmCorrigidoEm; data.kmCorrigidoValor=kmInf;
       log("Corrigiu KM do veículo",v.interno+": "+fmtNum(atual)+" → "+fmtNum(kmInf));
     } else if(kmInf>atual){ data.km=kmInf; data.kmEm=nowISO(); }
     if(retiradaAberta(id)) data.status="Em uso";
     Object.assign(v,data); log("Editou veículo",v.interno);
   }
   else { DB.veiculos.push({id:uid("v"),foto:null,...data,km:kmInf,kmEm:nowISO()}); log("Cadastrou veículo",data.interno); }
-  saveSync(["veiculos","auditoria"]); closeModal(); toast("Veículo salvo"); go("veiculos");
+  saveSync(["veiculos","auditoria"]); closeModal(); toast("Veículo salvo");
+  if(CURRENT==="wizard" && WZ && WZ.mode==="devolucao") renderDevWizard(); else go("veiculos");
 }
 
 /* ---- Página do veículo ---- */
 ROUTES["veiculo-det"]=async(el,id)=>{
   const v=veiculo(id); if(!v){go("veiculos");return;}
   const abast=DB.abastecimentos.filter(a=>a.veiculoId===id);
-  const man=DB.manutencoes.filter(m=>m.veiculoId===id);
+  const man=DB.manutencoes.filter(m=>m.veiculoId===id && !m.excluido);
   const outras=0;
   const custoComb=abast.reduce((s,a)=>s+(+a.total||0),0);
   const custoMan=man.reduce((s,m)=>s+(+m.valor||0),0);
@@ -1839,12 +1902,14 @@ ROUTES["veiculo-det"]=async(el,id)=>{
         <button class="btn sm" onclick="formVeiculo('${id}')">✏️ Editar</button>
         ${retiradaAberta(id)?`<button class="btn sm blue" onclick="startDevolucao('${retiradaAberta(id).id}')">🔄 Registrar entrega</button>
           <button class="btn sm sec" onclick="go('baixa-nova','${retiradaAberta(id).id}')">🧾 Dar baixa (não entregue)</button>
-          <button class="btn sm sec" onclick="formAlterarMotorista('${retiradaAberta(id).id}')">👤 Alterar motorista</button>`:""}
+          <button class="btn sm sec" onclick="formAlterarMotorista('${retiradaAberta(id).id}')">👤 Alterar motorista</button>
+          ${podeCorrigirKm()?`<button class="btn sm sec" onclick="formCorrigirKm('retiradas','${retiradaAberta(id).id}')">✏️ Corrigir KM da retirada</button>`:""}`:""}
         ${ehGerador(v)?"":`<button class="btn sm sec" onclick="formCalibragem('${id}')">🛞 Calibragem</button>`}
         <button class="btn sm sec" onclick="setStatus('${id}','Manutenção')">🔧 Manutenção</button>
         <button class="btn sm sec" onclick="setStatus('${id}','Disponível')">🟢 Disponível</button>
       </div>
     </div>
+    ${typeof mntSecaoVeiculo==="function"?mntSecaoVeiculo(id):""}
     ${ehGerador(v)?"":(()=>{ const c=calibStatus(id);
       return `<div class="section-title">🛞 Calibragem dos pneus <span class="line"></span></div>
       <div class="card" style="margin-bottom:14px"><div class="rec-lines">
@@ -1875,8 +1940,9 @@ ROUTES["veiculo-det"]=async(el,id)=>{
     <div id="v-timeline"></div>
   </div>`;
   const lk=kmLeituras(id).slice().reverse();
-  $("#v-kmhist").innerHTML = lk.length?`<div class="table-wrap"><table><thead><tr><th>Data</th><th>Evento</th><th style="text-align:right">KM</th><th>Motorista</th></tr></thead>
-    <tbody>${lk.map(l=>`<tr><td>${dtBR(l.data)}</td><td>${esc(l.evento)}</td><td style="text-align:right">${fmtNum(l.km)}</td><td>${esc(l.motorista)}</td></tr>`).join("")}</tbody></table></div>`
+  const ckOk=podeCorrigirKm();
+  $("#v-kmhist").innerHTML = lk.length?`${ckOk?`<div class="hint" style="margin-bottom:6px">KM digitado errado (ex.: um dígito a mais)? Toque em <b>✏️</b> na linha para corrigir.</div>`:""}<div class="table-wrap"><table><thead><tr><th>Data</th><th>Evento</th><th style="text-align:right">KM</th><th>Motorista</th>${ckOk?"<th></th>":""}</tr></thead>
+    <tbody>${lk.map(l=>`<tr><td>${dtBR(l.data)}</td><td>${esc(l.evento)}${l.corrigido?' <span class="tag orange" title="KM corrigido pelo gestor">corrigido</span>':""}</td><td style="text-align:right">${fmtNum(l.km)}</td><td>${esc(l.motorista)}</td>${ckOk?`<td>${l.aba?`<button class="btn sm sec" style="width:auto;padding:4px 10px" title="Corrigir KM" onclick="formCorrigirKm('${l.aba}','${l.ref}')">✏️</button>`:""}</td>`:""}</tr>`).join("")}</tbody></table></div>`
     :'<div class="empty"><div class="em">🛣️</div>Nenhuma leitura de KM ainda</div>';
   renderTimeline($("#v-timeline"),id);
 };
@@ -1894,7 +1960,7 @@ function renderTimeline(box,vid){
   DB.retiradas.filter(r=>r.veiculoId===vid).forEach(r=>ev.push({d:r.data,em:"🚗",t:"Retirada"+(r.baixaId?" — entrega NÃO registrada (baixa administrativa)":(r.devolvida?"":" — EM USO")),s:`👨‍✈️ ${nm(r.motoristaId,r.motoristaNome)} · KM ${fmtNum(r.kmInicial)} · ${esc(r.destinoNome)}${por(r)}${ob(r)}`, fotoBtn:`ret:${r.id}`}));
   DB.devolucoes.filter(x=>x.veiculoId===vid).forEach(x=>ev.push({d:x.data,em:"🔄",t:x.automatica?"Entrega automática":"Entrega",s:`👨‍✈️ ${nm(x.motoristaId,x.motoristaNome)} · KM ${fmtNum(x.kmFinal)} · percorrido ${fmtNum(x.kmPercorrido)} km${x.automatica?" · gerada automaticamente (versão antiga)":""}${por(x)}${ob(x)}`, fotoBtn:`dev:${x.id}`}));
   DB.abastecimentos.filter(a=>a.veiculoId===vid).forEach(a=>ev.push({d:a.data,em:"⛽",t:"Abastecimento",s:`${nm(a.motoristaId)} · ${a.km?"KM "+fmtNum(a.km)+" · ":""}${a.litros} ${unidadeAbast(a)} · ${fmtMoney(a.total)}${a.posto?" · "+esc(a.posto):""}${a.fotoPainel?" · 📷 foto do painel":""}${ob(a)}`, fotoBtn: (a.cupom||a.fotoPainel)?`ab:${a.id}`:null}));
-  DB.manutencoes.filter(m=>m.veiculoId===vid).forEach(m=>ev.push({d:m.data,em:"🔧",t:"Manutenção — "+esc(m.tipo),s:`${esc(m.descricao||"")}${m.km?" · KM "+fmtNum(m.km):""} · ${fmtMoney(m.valor)}`}));
+  DB.manutencoes.filter(m=>m.veiculoId===vid && !m.excluido).forEach(m=>ev.push({d:m.data,em:"🔧",t:"Manutenção — "+esc(m.tipo),s:`${esc(m.descricao||"")}${m.km?" · KM "+fmtNum(m.km):""} · ${fmtMoney(m.valor)}`}));
   (DB.calibragens||[]).filter(c=>c.veiculoId===vid).forEach(c=>ev.push({d:c.data,em:"🛞",t:"Calibragem dos pneus"+(c.extra?" (extra)":""),s:`${esc(c.responsavelNome||"—")}${c.km?" · KM "+fmtNum(c.km):""} · semana ${esc(c.semana||semanaISO(c.data))} · próxima solicitação ${dBR(proximaCalibragem(c))}${por(c)}${ob(c)}`}));
   (DB.baixas||[]).filter(b=>b.veiculoId===vid).forEach(b=>ev.push({d:b.registradoEm,em:"🧾",cls:"baixa",t:"Baixa administrativa — veículo não entregue",s:`👨‍✈️ ${nm(b.motoristaId,b.motoristaNome)} não registrou a entrega · motivo: ${esc(b.motivo)}${b.observacao?"<br>📝 "+esc(b.observacao):""}<br>Baixa por <b>${esc(b.responsavelBaixaNome)}</b> em ${dtBR(b.registradoEm)}`}));
   DB.ocorrencias.filter(o=>o.veiculoId===vid).forEach(o=>ev.push({d:o.data,em:"⚠️",t:"Ocorrência — "+esc(o.tipo),s:esc(o.descricao||"")}));
@@ -1955,7 +2021,10 @@ ROUTES.motoristas=(el)=>{
       <input id="m-search" placeholder="Buscar nome, matrícula...">
       <button class="btn sm" style="width:auto;white-space:nowrap" onclick="formMotorista()">＋ Novo</button>
     </div>
-    <button class="btn ghost" style="width:auto;font-size:12px;padding:6px 12px;margin-bottom:12px" onclick="redefinirMotoristas()">🔧 Corrigir lista (separar duplas)</button>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
+      <button class="btn ghost" style="width:auto;font-size:12px;padding:6px 12px" onclick="redefinirMotoristas()">🔧 Corrigir lista (separar duplas)</button>
+      <button class="btn ghost" style="width:auto;font-size:12px;padding:6px 12px" onclick="deduplicarMotoristas(false)">🧹 Remover nomes duplicados</button>
+    </div>
     <div id="m-list" class="list"></div></div>`;
   let q="";
   const render=()=>{
@@ -2039,8 +2108,11 @@ async function redefinirMotoristas(){
   });
 
   DB.motoristas = manter;
+  // se o mesmo nome estava cadastrado mais de uma vez, fica só um (com todo o histórico)
+  const dedup = aplicarDeduplicacaoMot(planoDuplicadosMot());
   log("Redefiniu lista de motoristas", MOTORISTAS_OFICIAIS.length+" oficiais");
   save();  // salva local primeiro
+  if(dedup.abas.length) saveSync(dedup.abas);
   // Corrige o BANCO CENTRAL de uma vez: apaga as duplas antigas da planilha e
   // regrava só a lista correta. Assim TODOS os aparelhos passam a ver certo,
   // sem precisar corrigir em cada celular.
@@ -2048,6 +2120,7 @@ async function redefinirMotoristas(){
     try{
       toast("Corrigindo na nuvem central...");
       await api("substituirTabela", {aba:"motoristas", registros: DB.motoristas});
+      marcarSync("motoristas", DB.motoristas);
       await api("setSeq",{v:DB._seq});
       toast("Lista corrigida na nuvem ✓ (vale para todos os aparelhos)");
     }catch(e){
@@ -2060,10 +2133,115 @@ async function redefinirMotoristas(){
   go("motoristas");
 }
 
+/* ============ NOMES DUPLICADOS ============
+   CAUSA: os aparelhos que ainda tinham a lista inicial (ids m1, m2...) no
+   armazenamento local reenviavam esses registros para a planilha, que já
+   tinha os mesmos nomes com outros ids (criados pela "Corrigir lista").
+   Resultado: cada técnico aparecia duas vezes.
+   Aqui: unifica os registros com o MESMO nome (sem diferenciar maiúsculas,
+   acentos e espaços), mantém um só, completa os dados que faltarem e
+   transfere TODO o histórico (retiradas, entregas, abastecimentos...) para
+   o registro que ficou — nada do passado se perde. */
+function chaveNome(s){ return String(s||"").normalize("NFD").replace(/[\u0300-\u036f]/g,"").replace(/\s+/g," ").trim().toLowerCase(); }
+var CAMPOS_REF_MOT = ["motoristaId","motoristaAtualId","ultimoMotoristaId","registradoPorId","responsavelId"];
+var TABELAS_REF_MOT = ["retiradas","devolucoes","abastecimentos","manutencoes","ocorrencias","calibragens","veiculos"]; // baixas e auditoria são imutáveis (guardam o nome)
+var CAMPOS_COMPLETAR_MOT = ["foto","cpf","matricula","telefone","funcao","cnh","cat","validadeCnh","obs"];
+
+/* Agrupa os duplicados e escolhe quem fica: ativo > com mais histórico > mais dados preenchidos. */
+function planoDuplicadosMot(){
+  const usos = {};
+  TABELAS_REF_MOT.forEach(t=>(DB[t]||[]).forEach(r=>CAMPOS_REF_MOT.forEach(c=>{ if(r&&r[c]) usos[r[c]]=(usos[r[c]]||0)+1; })));
+  const grupos = new Map();
+  DB.motoristas.forEach(m=>{ const k=chaveNome(m.nome); if(!k) return; if(!grupos.has(k)) grupos.set(k,[]); grupos.get(k).push(m); });
+  const pontos = m => (m.status==="Ativo"?1e9:0) + (usos[m.id]||0)*1000 + CAMPOS_COMPLETAR_MOT.filter(c=>m[c]).length;
+  const plano = [];
+  grupos.forEach(lista=>{
+    if(lista.length<2) return;
+    lista.sort((a,b)=>pontos(b)-pontos(a) || String(a.id).localeCompare(String(b.id)));
+    plano.push({manter:lista[0], remover:lista.slice(1)});
+  });
+  return plano;
+}
+function temMotoristasDuplicados(){ return planoDuplicadosMot().length>0; }
+
+/* Aplica no banco do aparelho. Retorna {removidos, abas} (abas de histórico alteradas). */
+function aplicarDeduplicacaoMot(plano){
+  const alias = {}; let removidos = 0;
+  plano.forEach(({manter,remover})=>{
+    remover.forEach(d=>{
+      alias[d.id] = manter.id; removidos++;
+      CAMPOS_COMPLETAR_MOT.forEach(c=>{ if(!manter[c] && d[c]) manter[c]=d[c]; });   // completa o que faltar
+      if(d.status==="Ativo") manter.status="Ativo";
+    });
+    // nome final: a grafia da lista oficial; senão, a que tem acentos (ex.: "André", não "Andre")
+    const grafias=[manter,...remover].map(m=>String(m.nome||"").replace(/\s+/g," ").trim());
+    const oficial=(typeof MOTORISTAS_OFICIAIS!=="undefined"?MOTORISTAS_OFICIAIS:[]).find(n=>chaveNome(n)===chaveNome(grafias[0]));
+    const acentos=n=>n.normalize("NFD").length-n.length;
+    manter.nome = oficial || grafias.slice().sort((x,y)=>acentos(y)-acentos(x))[0];
+  });
+  const abas = new Set();
+  TABELAS_REF_MOT.forEach(t=>(DB[t]||[]).forEach(r=>{
+    if(!r) return;
+    CAMPOS_REF_MOT.forEach(c=>{ if(r[c] && alias[r[c]]){ r[c]=alias[r[c]]; abas.add(t); } });
+  }));
+  DB.motoristas = DB.motoristas.filter(m=>!alias[m.id]);
+  return {removidos, abas:[...abas]};
+}
+
+function podeCorrigirCadastro(){ return !!SESSION && SESSION.tipo==="admin" && SESSION.nivel!=="Consulta"; }
+
+var DEDUP_MOT_RODANDO=false;
+/* auto=true: chamada automática depois de sincronizar (sem perguntas). */
+async function deduplicarMotoristas(auto){
+  if(DEDUP_MOT_RODANDO) return 0;
+  if(auto && !podeCorrigirCadastro()) return 0;
+  if(!auto && !podeCorrigirCadastro()){ toast("⚠ Somente Administrador ou Gestor pode corrigir a lista"); return 0; }
+  DEDUP_MOT_RODANDO=true;
+  try{
+    if(!auto && apiConfigurada()) await atualizarAntes("Atualizando a lista antes de corrigir...");
+    const plano = planoDuplicadosMot();
+    if(!plano.length){ if(!auto) toast("✓ Nenhum nome duplicado encontrado"); return 0; }
+    if(!auto){
+      const nomes = plano.map(p=>p.manter.nome).slice(0,12).join(", ")+(plano.length>12?"...":"");
+      if(!confirm(plano.length+" nome(s) aparecem duplicados:\n"+nomes+"\n\nVou deixar apenas UM registro de cada e transferir todo o histórico para ele. Continuar?")) return 0;
+    }
+    const {removidos, abas} = aplicarDeduplicacaoMot(plano);
+    log("Removeu motoristas duplicados", removidos+" registro(s) unificado(s)");
+    save();
+    let nuvemOk = true;
+    if(apiConfigurada()){
+      try{
+        await api("substituirTabela", {aba:"motoristas", registros: DB.motoristas});
+        marcarSync("motoristas", DB.motoristas);
+      }catch(e){ nuvemOk=false; console.warn("dedup na nuvem falhou:",e); }
+    }
+    saveSync([...abas,"auditoria"]);   // histórico transferido segue para a planilha
+    toast(nuvemOk ? "✓ "+removidos+" nome(s) duplicado(s) removido(s)"+(apiConfigurada()?" — corrigido para todos os aparelhos":"")
+                  : "⚠ Duplicados removidos neste aparelho, mas a nuvem não respondeu. Será tentado de novo automaticamente.");
+    if(typeof CURRENT!=="undefined" && ["motoristas","motorista-det","dashboard"].includes(CURRENT)) go(CURRENT==="motorista-det"?"motoristas":CURRENT);
+    return removidos;
+  } finally { DEDUP_MOT_RODANDO=false; }
+}
+
+/* Para listas exibidas a quem não pode corrigir (ex.: tela de login):
+   mostra cada nome uma única vez. */
+function semNomesRepetidos(lista){
+  const vistos = new Map();
+  lista.forEach(m=>{
+    const k=chaveNome(m.nome); if(!k) return;
+    const atual=vistos.get(k);
+    if(!atual || (atual.status!=="Ativo" && m.status==="Ativo")) vistos.set(k,m);
+  });
+  return [...vistos.values()];
+}
+
 function saveMotorista(id){
   const g=k=>$("#mf-"+k).value;
   const data={nome:g("nome"),cpf:g("cpf"),matricula:g("matricula"),telefone:g("telefone"),funcao:g("funcao"),cnh:g("cnh"),cat:g("cat"),validadeCnh:g("validadeCnh"),status:g("status"),obs:g("obs")};
+  data.nome=data.nome.replace(/\s+/g," ").trim();
   if(!data.nome){toast("Informe o nome");return;}
+  const repetido=DB.motoristas.find(m=>m.id!==id && chaveNome(m.nome)===chaveNome(data.nome));
+  if(repetido){toast("⚠ Já existe um motorista chamado \""+repetido.nome+"\""+(repetido.status!=="Ativo"?" (inativo — edite o cadastro dele)":""),"erro");return;}
   if(id){const m=motorista(id);Object.assign(m,data);log("Editou motorista",m.nome);}
   else{DB.motoristas.push({id:uid("m"),foto:null,...data});log("Cadastrou motorista",data.nome);}
   saveSync(["motoristas","auditoria"]);closeModal();toast("Motorista salvo");go("motoristas");
@@ -2206,7 +2384,7 @@ function wzClear(){ localStorage.removeItem(WZ_KEY); WZ=null; }
 
 /* ---------- HOME MOTORISTA ---------- */
 ROUTES["mot-home"]=(el)=>{
-  const emUso=DB.retiradas.filter(r=>!r.devolvida && r.motoristaId===SESSION.id && veiculo(r.veiculoId));
+  const emUso=DB.retiradas.filter(r=>!r.devolvida && retiradaDoUsuario(r) && veiculo(r.veiculoId));
   const draft=wzLoad();
   el.innerHTML=`<div class="wrap">
     <h2 class="page-title">🏠 Olá, ${esc(SESSION.nome.split(/[\s,]/)[0])}! <small>Seus registros saem automaticamente em seu nome.</small></h2>
@@ -2227,7 +2405,7 @@ ROUTES["mot-home"]=(el)=>{
           <div class="s">→ ${esc(r.destinoNome)} · saída ${dtBR(r.data)} · KM ${fmtNum(r.kmInicial)}</div>
           ${entregaAtrasada(r)?`<div class="s" style="color:var(--orange);font-weight:700">⏰ Retirada há ${tempoDesde(r.data)} — registre a entrega ao devolver a viatura</div>`:""}</div>
           <button class="btn sm blue" onclick="startDevolucao('${r.id}')">Devolver</button></div>
-          ${calibAlertaHTML(v.id)}`;
+          ${calibAlertaHTML(v.id)}${typeof mntAvisoMotorista==="function"?mntAvisoMotorista(v.id):""}`;
       }).join("")}</div>`:""}
   </div>`;
 };
@@ -2235,7 +2413,7 @@ function resumeWizard(){ WZ=wzLoad(); if(WZ&&WZ.mode==="retirada") renderWizard(
 
 /* ---------- MEUS REGISTROS ---------- */
 ROUTES["mot-hist"]=(el)=>{
-  const rets=DB.retiradas.filter(r=>r.motoristaId===SESSION.id).slice().reverse();
+  const rets=DB.retiradas.filter(r=>retiradaDoUsuario(r)).slice().reverse();
   el.innerHTML=`<div class="wrap"><h2 class="page-title">📋 Meus registros</h2>
     <div class="list">${rets.length?rets.map(r=>{
       const v=veiculo(r.veiculoId);
@@ -2355,7 +2533,8 @@ function stVeiculo(b){
       <div class="av">${v.tipo==="Moto"?"🏍️":esc(v.interno.replace("V-",""))}</div>
       <div class="info"><div class="t">${esc(v.interno)} · ${esc(v.placa)}${statusVeiculo(v)!=="Disponível"?" · "+esc(statusVeiculo(v)):""}</div>
       <div class="s">${esc([v.marca,v.modelo].filter(Boolean).join(" ")||v.tipo)} · ${fmtKm(kmAtual(v.id))}</div>
-      ${cs.nivel!=="ok"?`<div class="s" style="color:${cs.cor==="red"?"var(--red)":"var(--gold)"};font-weight:700">🛞 ${esc(cs.rotulo)}</div>`:""}</div><div class="chk"></div></div>`;
+      ${cs.nivel!=="ok"?`<div class="s" style="color:${cs.cor==="red"?"var(--red)":"var(--gold)"};font-weight:700">🛞 ${esc(cs.rotulo)}</div>`:""}
+      ${typeof mntLinhaAviso==="function"?mntLinhaAviso(v.id):""}</div><div class="chk"></div></div>`;
   };
   const sel=WZ.veiculoId?veiculo(WZ.veiculoId):null;
   b.innerHTML=`<h3>Qual viatura?</h3><p class="desc">Somente viaturas <b>disponíveis</b> podem ser retiradas.</p>
@@ -2663,6 +2842,7 @@ async function finalizarRetirada(){
       if(!erroDeRede(e)){
         const d=e.dados||{};
         if(d.erro==="VEICULO_EM_USO"){
+          adotarDoServidor([{aba:"retiradas",registro:d.retirada},{aba:"veiculos",registro:d.veiculo}]);
           await atualizarAntes();
           const c=d.conflito||{};
           alert((v.interno+" · "+v.placa)+" acabou de ser retirado em outro aparelho.\n\nMotorista: "+(c.motoristaNome||"—")+
@@ -2843,7 +3023,7 @@ function removePhoto(key){
 ROUTES["mot-devolver"]=(el)=>{
   const desenhar=()=>{
     if(CURRENT!=="mot-devolver") return;
-    const emUso=DB.retiradas.filter(r=>!r.devolvida && veiculo(r.veiculoId) && (SESSION.tipo!=="motorista"||r.motoristaId===SESSION.id))
+    const emUso=DB.retiradas.filter(r=>!r.devolvida && veiculo(r.veiculoId) && (SESSION.tipo!=="motorista"||retiradaDoUsuario(r)))
       .sort((a,b)=>new Date(b.data)-new Date(a.data));
     el.innerHTML=`<div class="wrap"><h2 class="page-title">🔄 Devolver viatura</h2>
       <p class="desc" style="color:var(--muted)">Selecione a viatura em uso para registrar a entrega.</p>
@@ -2851,7 +3031,8 @@ ROUTES["mot-devolver"]=(el)=>{
         return `<div class="opt" onclick="startDevolucao('${r.id}')"><div class="av">${esc(v.interno.replace("V-",""))}</div>
           <div class="info"><div class="t">${esc(v.interno)} · ${esc(v.placa)}</div>
           <div class="s">👨‍✈️ ${esc(m?.nome||r.motoristaNome||"")} → ${esc(r.destinoNome)} · saída ${dtBR(r.data)} · KM ${fmtNum(r.kmInicial)}</div></div>›</div>`;
-      }).join(""):'<div class="empty"><div class="em">🅿️</div>Nenhuma viatura em uso'+(SESSION.tipo==="motorista"?" no seu nome":"")+'</div>'}</div></div>`;
+      }).join(""):'<div class="empty"><div class="em">🅿️</div>Nenhuma viatura em uso'+(SESSION.tipo==="motorista"?" no seu nome":"")+'</div>'}</div>
+      ${SESSION.tipo==="motorista"?`<div class="hint" style="margin-top:10px">Pegou uma viatura que está no nome de outro motorista? Peça ao gestor para usar <b>👤 Alterar motorista</b> na página do veículo — depois ela aparece aqui para você devolver.</div>`:""}</div>`;
   };
   desenhar();
   // atualiza da nuvem: a retirada pode ter sido feita em outro aparelho
@@ -2865,6 +3046,10 @@ async function startDevolucao(retId){
     await atualizarAntes();
     r=DB.retiradas.find(x=>x.id===retId);
     if(r && r.devolvida){ alert("Esta retirada já teve a entrega registrada."); go(SESSION.tipo==="motorista"?"mot-home":"dashboard"); return; }
+  }
+  if(SESSION.tipo==="motorista" && !retiradaDoUsuario(r)){
+    alert("Esta viatura está no nome de "+(motorista(r.motoristaId)?.nome||r.motoristaNome||"outro motorista")+".\n\nPeça ao gestor para usar “👤 Alterar motorista” na página do veículo e tente de novo.");
+    return;
   }
   closeModal();
   WZ={mode:"devolucao",step:0,retiradaId:retId,veiculoId:r.veiculoId,motoristaId:r.motoristaId,
@@ -2898,8 +3083,13 @@ function dvKm(b){
       <div class="rl"><span>Motorista que estava usando</span><b>${esc(m?.nome||r.motoristaNome||"—")}</b></div>
       <div class="rl"><span>Retirado em</span><b>${dtBR(r.data)}</b></div>
       <div class="rl"><span>KM na retirada</span><b>${fmtNum(r.kmInicial)}</b></div>
-      ${minimo>(+r.kmInicial||0)?`<div class="rl"><span>Última leitura registrada</span><b>${fmtNum(minimo)}</b></div>`:""}
+      ${minimo>(+r.kmInicial||0)?(()=>{ const lm=leituraMaxima(WZ.veiculoId); return `<div class="rl"><span>Última leitura registrada</span><b>${fmtNum(minimo)}${lm?" · "+esc(lm.evento)+" "+dBR(lm.data):""}</b></div>`; })():""}
     </div>
+    ${podeCorrigirKm()?`<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px">
+        <button class="btn sm sec" style="width:auto" onclick="formCorrigirKm('retiradas','${r.id}')">✏️ Corrigir KM da retirada</button>
+        ${minimo>(+r.kmInicial||0)?(leituraMaxima(WZ.veiculoId)&&leituraMaxima(WZ.veiculoId).ref!==r.id?`<button class="btn sm sec" style="width:auto" onclick="formCorrigirKm('${leituraMaxima(WZ.veiculoId).aba}','${leituraMaxima(WZ.veiculoId).ref}')">✏️ Corrigir última leitura</button>`
+          :`<button class="btn sm sec" style="width:auto" onclick="formVeiculo('${WZ.veiculoId}')">✏️ Corrigir KM do veículo</button>`):""}
+      </div>`:""}
     <label>KM final</label><input id="dv-km" type="number" inputmode="numeric" value="${esc(WZ.kmFinal)}" placeholder="Ex.: 85487" oninput="WZ.kmFinal=this.value;wzSave();dvKmCalc()">
     <div class="hint" id="dv-calc"></div>
     <label style="margin-top:14px">Observações da entrega (opcional)</label>
@@ -2913,7 +3103,9 @@ function dvKmCalc(){
   const h=$("#dv-calc"); if(!h)return;
   const perc=(+WZ.kmFinal)-(r.kmInicial);
   if(!WZ.kmFinal){h.textContent="";return;}
-  if(+WZ.kmFinal<dvKmMin()){h.innerHTML="<b style='color:var(--red)'>"+esc(MSG_KM_INVALIDO)+"</b>";}
+  if(+WZ.kmFinal<dvKmMin()){h.innerHTML="<b style='color:var(--red)'>"+esc(MSG_KM_INVALIDO)+"</b><br>"+
+    (podeCorrigirKm()?"Se o KM da retirada (ou a última leitura) foi digitado errado, use o botão <b>✏️ Corrigir</b> acima.":
+     "Se o KM da retirada foi digitado errado (ex.: um dígito a mais), peça ao gestor para corrigir — ele consegue pelo aplicativo. Depois é só continuar a entrega.");}
   else h.innerHTML=`Percorrido: <b style="color:var(--green)">${fmtNum(perc)} km</b>`;
 }
 function dvKmGo(){
@@ -2984,6 +3176,10 @@ async function finalizarDevolucao(){
   if(r.devolvida){ alert("Esta retirada já teve a entrega registrada (em outro aparelho)."); wzClear(); go(SESSION.tipo==="motorista"?"mot-home":"dashboard"); return; }
   const erroKm=validarKm(v.id, WZ.kmFinal, Math.max(+r.kmInicial||0, kmAtual(v.id)));
   if(erroKm){ alert(erroKm); WZ.step=0; wzSave(); renderDevWizard(); return; }
+  if(SESSION.tipo==="motorista" && String(r.motoristaId)!==String(SESSION.id) && retiradaDoUsuario(r) && !motorista(r.motoristaId)){
+    // retirada registrada com o id de um cadastro duplicado que já foi removido
+    r.motoristaIdAnterior=r.motoristaId; r.motoristaId=SESSION.id; r.motoristaNome=SESSION.nome;
+  }
 
   // 2) fotos
   const did=uid("dev");
@@ -3114,7 +3310,7 @@ function formAbastecimento(tipo){
   const vs=DB.veiculos, ms=DB.motoristas.filter(m=>m.status==="Ativo");
   const motDefault=SESSION.tipo==="motorista"?SESSION.id:"";
   // motorista: já sugere o veículo que está com ele
-  const veicDefault=SESSION.tipo==="motorista"?(DB.retiradas.find(r=>!r.devolvida&&r.motoristaId===SESSION.id)?.veiculoId||""):"";
+  const veicDefault=SESSION.tipo==="motorista"?(DB.retiradas.find(r=>!r.devolvida&&retiradaDoUsuario(r))?.veiculoId||""):"";
   window._painel=null; window._cupom=null;
   const geradoresUsados=[...new Set(DB.abastecimentos.filter(a=>a.tipo==="gerador"&&a.gerador).map(a=>a.gerador))];
   openModal("Registrar abastecimento",`
@@ -3132,9 +3328,9 @@ function formAbastecimento(tipo){
 
     <div id="ab-box-ger" style="margin-top:10px;display:none">
       <label>Gerador / equipamento</label>
-      <input id="ab-ger" list="ab-ger-opts" placeholder="Ex.: Gerador Base Volta Redonda">
+      <input id="ab-ger" list="ab-ger-opts" placeholder="Ex.: Gerador Base Niterói">
       <datalist id="ab-ger-opts">${geradoresUsados.map(g=>`<option value="${esc(g)}">`).join("")}</datalist>
-      <label>Local / base</label><input id="ab-local" placeholder="Ex.: Volta Redonda">
+      <label>Local / base</label><input id="ab-local" placeholder="Ex.: Niterói">
       <div class="hint">Use para compra de combustível de gerador a gasolina ou diesel (não entra no custo por km da frota).</div>
     </div>
 
@@ -3257,7 +3453,7 @@ ROUTES.manutencao=(el)=>{
   el.innerHTML=`<div class="wrap"><h2 class="page-title">🔧 Manutenção</h2>
     <button class="btn" style="margin-bottom:14px" onclick="formManutencao()">＋ Registrar manutenção</button>
     <div class="list" id="mn-list"></div></div>`;
-  const arr=DB.manutencoes.slice().reverse();
+  const arr=DB.manutencoes.filter(m=>!m.excluido).sort((a,b)=>String(b.data||"").localeCompare(String(a.data||"")));
   $("#mn-list").innerHTML=arr.length?arr.map(m=>{const v=veiculo(m.veiculoId);
     return `<div class="row-item"><div class="av">🔧</div>
       <div class="main"><div class="t">${esc(v?.interno||"—")} · ${esc(m.tipo)}</div>
@@ -3323,7 +3519,7 @@ function formCalibragem(vid){
   closeModal();
   const vs=DB.veiculos.filter(v=>!ehGerador(v)), ms=DB.motoristas.filter(m=>m.status==="Ativo");
   const motDefault=SESSION.tipo==="motorista"?SESSION.id:"";
-  if(!vid && SESSION.tipo==="motorista") vid=DB.retiradas.find(r=>!r.devolvida&&r.motoristaId===SESSION.id)?.veiculoId||"";
+  if(!vid && SESSION.tipo==="motorista") vid=DB.retiradas.find(r=>!r.devolvida&&retiradaDoUsuario(r))?.veiculoId||"";
   openModal("Registrar calibragem dos pneus",`
     <label>Veículo</label><select id="cb-veic" onchange="cbVeicMudou()"><option value="">Selecione</option>${vs.map(v=>`<option value="${v.id}" ${v.id===vid?"selected":""}>${esc(v.interno)} · ${esc(v.placa)}</option>`).join("")}</select>
     <div id="cb-info" class="hint"></div>
@@ -3398,7 +3594,7 @@ ROUTES.ocorrencias=(el)=>{
 function formOcorrencia(){
   const vs=DB.veiculos,ms=DB.motoristas.filter(m=>m.status==="Ativo");
   const motDefault=SESSION.tipo==="motorista"?SESSION.id:"";
-  const veicOcc=SESSION.tipo==="motorista"?(DB.retiradas.find(r=>!r.devolvida&&r.motoristaId===SESSION.id)?.veiculoId||""):"";
+  const veicOcc=SESSION.tipo==="motorista"?(DB.retiradas.find(r=>!r.devolvida&&retiradaDoUsuario(r))?.veiculoId||""):"";
   openModal("Nova ocorrência",`
     <label>Tipo</label><select id="o-tipo">${["Acidente","Avaria","Pane","Multa","Problema mecânico","Falta de combustível","Problema operacional","Outro"].map(o=>`<option>${o}</option>`).join("")}</select>
     <label>Veículo</label><select id="o-veic"><option value="">Selecione</option>${vs.map(v=>`<option value="${v.id}" ${v.id===veicOcc?"selected":""}>${esc(v.interno)} · ${esc(v.placa)}</option>`).join("")}</select>
@@ -3449,7 +3645,7 @@ function updOccStatus(id){const o=DB.ocorrencias.find(x=>x.id===id);o.status=$("
 /* ============ CÁLCULOS DE CUSTO POR VEÍCULO ============ */
 function veiculoStats(vid){
   const abast=DB.abastecimentos.filter(a=>a.veiculoId===vid);
-  const man=DB.manutencoes.filter(m=>m.veiculoId===vid);
+  const man=DB.manutencoes.filter(m=>m.veiculoId===vid && !m.excluido);
   const devs=DB.devolucoes.filter(d=>d.veiculoId===vid);
   const comb=abast.reduce((s,a)=>s+(+a.total||0),0);
   const manut=man.reduce((s,m)=>s+(+m.valor||0),0);
@@ -3554,12 +3750,13 @@ function computeAlertas(resumo){
     else if(days<=30)al.push({level:"yellow",em:"🟡",t:"CNH próxima do vencimento",s:m.nome+" · "+days+" dias"});
   });
   DB.manutencoes.forEach(mn=>{
-    if(!mn.proximaData)return;
+    if(!mn.proximaData||mn.excluido)return;
     const days=Math.ceil((new Date(mn.proximaData)-new Date())/86400000);
     const v=veiculo(mn.veiculoId);
     if(days<0)al.push({level:"red",em:"🔴",t:"Manutenção atrasada",s:(v?.interno||"")+" · "+mn.tipo});
     else if(days<=15)al.push({level:"yellow",em:"🟡",t:"Manutenção próxima",s:(v?.interno||"")+" · "+mn.tipo+" em "+days+"d"});
   });
+  if(typeof mntAlertasGerais==="function") mntAlertasGerais(resumo).forEach(a=>al.push(a));
   DB.ocorrencias.filter(o=>o.status!=="Resolvida").forEach(o=>{
     const v=veiculo(o.veiculoId);
     al.push({level:"red",em:"⚠️",t:"Veículo com ocorrência",s:(v?.interno||"")+" · "+o.tipo});
@@ -3673,7 +3870,7 @@ function gerarRelatorio(tipo){
       rows.push([v.interno,s.comb.toFixed(2),s.manut.toFixed(2),s.total.toFixed(2),s.km,s.custoKm.toFixed(2)]);});
   } else if(tipo==="manutencao"){
     title="Relatório de Manutenção";head=["Data","Veículo","Tipo","Oficina","Valor"];
-    DB.manutencoes.filter(m=>f.test(m.data,m.veiculoId,"")).forEach(m=>{const v=veiculo(m.veiculoId);
+    DB.manutencoes.filter(m=>!m.excluido && f.test(m.data,m.veiculoId,"")).forEach(m=>{const v=veiculo(m.veiculoId);
       rows.push([dBR(m.data),v?.interno||"",m.tipo,m.oficina,m.valor]);});
   } else if(tipo==="ocorrencias"){
     title="Relatório de Ocorrências";head=["Data","Veículo","Motorista","Tipo","Status"];
@@ -3858,8 +4055,8 @@ preencherMotoristas=function(){
   const sel=$("#mot-select"); if(!sel) return;
   if(!LISTA_LOGIN_MOT) return _preencherMotoristasBase();
   const atual=sel.value;
-  sel.innerHTML='<option value="">Selecione seu nome...</option>'+LISTA_LOGIN_MOT.filter(m=>(m.status||"Ativo")==="Ativo")
-    .slice().sort((a,b)=>(a.nome||"").localeCompare(b.nome||"","pt-BR")).map(m=>`<option value="${esc(m.id)}">${esc(m.nome)}</option>`).join("");
+  sel.innerHTML='<option value="">Selecione seu nome...</option>'+semNomesRepetidos(LISTA_LOGIN_MOT.filter(m=>(m.status||"Ativo")==="Ativo"))
+    .sort((a,b)=>(a.nome||"").localeCompare(b.nome||"","pt-BR")).map(m=>`<option value="${esc(m.id)}">${esc(m.nome)}</option>`).join("");
   if(atual) sel.value=atual;
 };
 
@@ -3927,6 +4124,7 @@ function abrirPainelSync(){
   const pend=filaTamanho(), fotos=fotosPendentes().length;
   openModal("Sincronização",`
     <div class="rec-lines">
+      <div class="rl"><span>Versão do servidor</span><b>${!apiConfigurada()?"—":(BACKEND_V>=6?"v"+BACKEND_V+" ✓":"<span style='color:var(--orange)'>antiga — publique a versão 6 do Apps Script</span>")}</b></div>
       <div class="rl"><span>Conexão</span><b>${!apiConfigurada()?"Modo local (sem nuvem)":(navigator.onLine?"Online":"Sem internet")}</b></div>
       <div class="rl"><span>Última atualização</span><b>${ULTIMO_PULL?dtBR(new Date(ULTIMO_PULL).toISOString()):"—"}</b></div>
       <div class="rl"><span>Registros aguardando envio</span><b>${pend}</b></div>
@@ -4276,6 +4474,957 @@ function salvarAlteracaoMotorista(retId){
   saveSync(["retiradas","veiculos","auditoria"]); closeModal(); toast("Motorista alterado ✓","ok"); go("veiculo-det",r.veiculoId);
 }
 
+/* ======================================================================
+   CORREÇÃO DE KM PELO GESTOR — erro de digitação (ex.: dígito a mais)
+   Corrige o KM de uma retirada, entrega, abastecimento, manutenção ou
+   calibragem. O valor antigo fica guardado no próprio registro
+   (correcoesKm) e na auditoria. O KM atual do veículo é recalculado e
+   marcado como correção (kmCorrigidoEm): o servidor e os outros aparelhos
+   aceitam o valor menor e o motorista consegue registrar a entrega com o
+   KM certo.
+   ====================================================================== */
+function podeCorrigirKm(){ return !!SESSION && SESSION.tipo==="admin" && SESSION.nivel!=="Consulta"; }
+/* Leitura que define o KM atual (a maior depois da última correção). */
+function leituraMaxima(vid){
+  const v=veiculo(vid); if(!v) return null;
+  const corte=tms(v.kmCorrigidoEm); let best=null;
+  kmLeituras(vid).forEach(l=>{ if(corte && tms(l.data)<=corte) return; if(!best || l.km>best.km) best=l; });
+  return best && best.km>=(+v.km||0) ? best : null;
+}
+/* KM que o veículo passa a ter se o registro refId tiver o valor novo. */
+function kmVeiculoAposCorrecao(vid,refId,novo){
+  const v=veiculo(vid); if(!v) return +novo||0;
+  const corte=tms(v.kmCorrigidoEm);
+  let km=corte?(+v.kmCorrigidoValor||0):0;
+  kmLeituras(vid).forEach(l=>{
+    if(corte && tms(l.data)<=corte) return;
+    const val=l.ref===refId?(+novo||0):l.km;
+    if(val>km) km=val;
+  });
+  return km;
+}
+function formCorrigirKm(aba,id){
+  if(!podeCorrigirKm()){ toast("Somente o gestor pode corrigir o KM","erro"); return; }
+  const campo=CAMPO_KM_ABA[aba], reg=(DB[aba]||[]).find(x=>x.id===id);
+  if(!campo || !reg){ toast("Registro não encontrado","erro"); return; }
+  const v=veiculo(reg.veiculoId);
+  const corte=tms(v?.kmCorrigidoEm);
+  const afeta=!!v && !(corte && tms(reg.data)<=corte);
+  const nomeM=motorista(reg.motoristaId)?.nome||reg.motoristaNome||reg.responsavelNome||"—";
+  const hist=(reg.correcoesKm||[]).map(c=>`<div class="rl"><span>Correção anterior</span><b>${fmtNum(c.de)} → ${fmtNum(c.para)} · ${esc(c.por||"")} ${dtBR(c.em)}</b></div>`).join("");
+  openModal("Corrigir quilometragem",`
+    <div class="rec-lines">
+      <div class="rl"><span>Veículo</span><b>${esc(v?.interno||"")} · ${esc(v?.placa||"")}</b></div>
+      <div class="rl"><span>Registro</span><b>${esc(ROTULO_KM_ABA[aba])} · ${dtBR(reg.data)}</b></div>
+      <div class="rl"><span>Motorista</span><b>${esc(nomeM)}</b></div>
+      ${aba==="devolucoes"?`<div class="rl"><span>KM na retirada</span><b>${fmtNum(reg.kmInicial)}</b></div>`:""}
+      <div class="rl"><span>KM registrado</span><b style="color:var(--red)">${fmtNum(reg[campo])}</b></div>
+      ${hist}
+    </div>
+    <label>KM correto *</label>
+    <input id="ck-km" type="number" inputmode="numeric" placeholder="Digite o KM certo" oninput="ckCalc('${aba}','${id}')">
+    <div class="hint" id="ck-calc"></div>
+    ${afeta?`<label>KM atual do veículo depois da correção</label>
+      <input id="ck-veic" type="number" inputmode="numeric" value="${esc(kmAtual(v.id))}" oninput="this.dataset.manual='1'">
+      <div class="hint">Calculado automaticamente pelo histórico. Só altere se souber o valor exato do painel.</div>`
+      :`<div class="hint">Este registro é anterior à última correção de KM do veículo — o KM atual do veículo (${fmtNum(kmAtual(v?.id))}) não muda.</div>`}
+    <label>Motivo da correção *</label>
+    <textarea id="ck-motivo" placeholder="Ex.: motorista digitou um dígito a mais (854870 em vez de 85487)"></textarea>
+    <div class="hint">O valor antigo fica guardado no registro e na auditoria (quem corrigiu, quando, de quanto para quanto e por quê).</div>
+    <div class="wizard-nav"><button class="btn sec" onclick="closeModal()">Cancelar</button>
+      <button class="btn" onclick="salvarComBotao(this,()=>salvarCorrecaoKm('${aba}','${id}'))">Salvar correção</button></div>`);
+  setTimeout(()=>{ const i=$("#ck-km"); if(i) i.focus(); },50);
+}
+function ckDevDaRetirada(r){ return DB.devolucoes.find(d=>d.id===r.devolucaoId) || DB.devolucoes.find(d=>d.retiradaId===r.id) || null; }
+function ckCalc(aba,id){
+  const campo=CAMPO_KM_ABA[aba], reg=(DB[aba]||[]).find(x=>x.id===id), h=$("#ck-calc");
+  if(!reg || !h) return;
+  const txt=$("#ck-km").value, novo=+txt;
+  const iv=$("#ck-veic");
+  if(txt===""||isNaN(novo)){ h.textContent=""; if(iv && !iv.dataset.manual) iv.value=kmAtual(reg.veiculoId); return; }
+  if(iv && !iv.dataset.manual) iv.value=kmVeiculoAposCorrecao(reg.veiculoId,id,novo);
+  const msgs=[];
+  const ant=kmLeituras(reg.veiculoId).filter(l=>l.ref!==id && tms(l.data)<tms(reg.data)).pop();
+  if(ant && novo<ant.km) msgs.push(`<b style="color:var(--orange)">⚠ Menor que a leitura anterior (${fmtNum(ant.km)} · ${esc(ant.evento)} ${dBR(ant.data)}).</b>`);
+  if(aba==="devolucoes"){
+    const p=novo-(+reg.kmInicial||0);
+    msgs.push(p<0?`<b style="color:var(--red)">Menor que o KM da retirada (${fmtNum(reg.kmInicial)}).</b>`:`Percorrido passa a ser <b style="color:var(--green)">${fmtNum(p)} km</b>.`);
+  }
+  if(aba==="retiradas"){
+    const d=ckDevDaRetirada(reg);
+    if(d){ const p=(+d.kmFinal||0)-novo; msgs.push(p<0?`<b style="color:var(--red)">Maior que o KM da entrega (${fmtNum(d.kmFinal)}) — corrija a entrega também.</b>`:`Percorrido da entrega passa a ser <b style="color:var(--green)">${fmtNum(p)} km</b>.`); }
+    else if(!reg.devolvida) msgs.push(`Na entrega, o KM final precisará ser a partir de <b>${fmtNum(novo)}</b>.`);
+  }
+  h.innerHTML=msgs.join("<br>");
+}
+function salvarCorrecaoKm(aba,id){
+  const campo=CAMPO_KM_ABA[aba], reg=(DB[aba]||[]).find(x=>x.id===id);
+  if(!campo || !reg){ toast("Registro não encontrado","erro"); return; }
+  const txt=$("#ck-km").value, motivo=$("#ck-motivo").value.trim();
+  if(txt==="" || isNaN(+txt) || +txt<0){ toast("Informe o KM correto","erro"); return; }
+  const novo=Math.round(+txt), antes=+reg[campo]||0;
+  if(novo===antes){ toast("O KM informado é igual ao que já está registrado","erro"); return; }
+  if(!motivo){ toast("Informe o motivo da correção","erro"); return; }
+  let dev=null;
+  if(aba==="devolucoes" && novo<(+reg.kmInicial||0)){
+    alert("O KM da entrega não pode ser menor que o KM da retirada ("+fmtNum(reg.kmInicial)+").\n\nSe o KM da retirada também está errado, corrija a retirada primeiro."); return;
+  }
+  if(aba==="retiradas"){
+    dev=ckDevDaRetirada(reg);
+    if(dev && (+dev.kmFinal||0)<novo){ alert("O KM da retirada ficaria maior que o KM da entrega ("+fmtNum(dev.kmFinal)+").\n\nCorrija primeiro o KM da entrega."); return; }
+  }
+  const v=veiculo(reg.veiculoId);
+  const corte=tms(v?.kmCorrigidoEm);
+  const afeta=!!v && !(corte && tms(reg.data)<=corte);
+  const agora=nowISO();
+  const corr={campo,de:antes,para:novo,por:SESSION.nome,porId:SESSION.id,em:agora,motivo};
+  reg[campo]=novo;
+  reg.correcoesKm=(reg.correcoesKm||[]).concat([corr]);
+  const abas=new Set([aba]);
+  if(aba==="devolucoes") reg.kmPercorrido=novo-(+reg.kmInicial||0);
+  if(dev){
+    dev.kmInicial=novo; dev.kmPercorrido=(+dev.kmFinal||0)-novo;
+    dev.correcoesKm=(dev.correcoesKm||[]).concat([{...corr,campo:"kmInicial",origem:"retirada"}]);
+    abas.add("devolucoes");
+  }
+  let kmV=null;
+  if(afeta){
+    const iv=$("#ck-veic");
+    kmV=Math.round(iv && iv.value!=="" && !isNaN(+iv.value) ? +iv.value : kmVeiculoAposCorrecao(v.id,id,novo));
+    v.km=kmV; v.kmEm=agora; v.kmCorrigidoEm=agora; v.kmCorrigidoValor=kmV;
+    abas.add("veiculos");
+  }
+  log("Corrigiu KM",(v?.interno||"")+" · "+ROTULO_KM_ABA[aba]+" de "+dtBR(reg.data)+": "+fmtNum(antes)+" → "+fmtNum(novo)+
+    (kmV!=null?" · KM do veículo: "+fmtNum(kmV):"")+" · motivo: "+motivo);
+  abas.add("auditoria");
+  saveSync([...abas]); closeModal(); toast("KM corrigido ✓","ok");
+  if(CURRENT==="wizard" && WZ && WZ.mode==="devolucao") renderDevWizard();
+  else if(v) go("veiculo-det",v.id);
+}
+
+</script>
+
+<!-- ===================== MANUTENÇÃO PREVENTIVA ===================== -->
+<style>
+.mnt-itens{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+@media (max-width:760px){.mnt-itens{grid-template-columns:1fr}}
+.mnt-item{display:flex;flex-direction:column;gap:9px;border-top:3px solid var(--mc,var(--line2))}
+.mnt-item.vencida{--mc:var(--red)} .mnt-item.proxima{--mc:var(--orange)} .mnt-item.em_dia{--mc:var(--green)}
+.mnt-item .i-top{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}
+.mnt-item h4{margin:0;font-size:15px;font-weight:700}
+.mnt-item .i-int{font-size:12px;color:var(--muted);margin-top:2px}
+.mnt-item .i-rest{font-family:var(--f-head);font-size:24px;font-weight:700;line-height:1.1}
+.mnt-item.vencida .i-rest{color:var(--red)} .mnt-item.proxima .i-rest{color:var(--orange)}
+.mnt-item .i-rest small{font-size:14px;color:var(--muted);font-weight:600;margin-left:3px}
+.mnt-bar{height:6px;border-radius:4px;background:#0b0f15;overflow:hidden}
+.mnt-bar>div{height:100%;background:var(--mc,var(--gold2));border-radius:4px}
+.mnt-dl{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;font-size:13px;margin:0}
+.mnt-dl dt{color:var(--muted)} .mnt-dl dd{margin:0;text-align:right;font-weight:600}
+.mnt-pos{display:grid;gap:3px;font-size:12px;color:var(--muted);border-top:1px dashed var(--line);padding-top:7px}
+.mnt-pos div{display:flex;justify-content:space-between;gap:8px}
+.mnt-nota{font-size:12px;color:var(--orange);line-height:1.4}
+.mnt-nota.neutra{color:var(--muted2)}
+.mnt-odo{display:inline-flex;gap:3px;align-items:flex-end}
+.mnt-odo span{min-width:24px;padding:4px 0;text-align:center;font-family:'JetBrains Mono',ui-monospace,Consolas,monospace;font-size:22px;font-weight:700;
+  background:linear-gradient(180deg,#0b1219,#020407 50%,#0b1219);border:1px solid var(--line2);border-radius:4px;color:#f3f6f8}
+.mnt-odo span.sep{min-width:auto;background:none;border:0;color:var(--muted);padding:0}
+.mnt-odo small{font-size:12px;color:var(--muted);margin-left:5px;padding-bottom:5px}
+.mnt-filtros{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:12px}
+.mnt-filtros label{margin-top:0}
+@media (max-width:760px){.mnt-filtros{grid-template-columns:1fr 1fr}}
+.mnt-chk-pos{display:flex;flex-wrap:wrap;gap:8px}
+.mnt-chk-pos label{display:inline-flex;align-items:center;gap:8px;margin:0;padding:9px 12px;border:1px solid var(--line2);border-radius:10px;color:var(--txt);font-size:14px}
+.mnt-chk-pos input{width:auto;accent-color:var(--accent)}
+.mnt-prev{font-size:13px;background:rgba(95,163,255,.07);border:1px solid rgba(95,163,255,.25);border-radius:10px;padding:10px 12px;margin-top:12px}
+.mnt-prev:empty{display:none}
+.mnt-box-red{font-size:13px;background:rgba(239,83,80,.1);border:1px solid rgba(239,83,80,.45);border-radius:10px;padding:10px 12px;margin-top:12px}
+tr.mnt-exc td{opacity:.55;text-decoration:line-through} tr.mnt-exc td:last-child{text-decoration:none}
+.mnt-modelos .lin{display:grid;grid-template-columns:1.3fr 1fr 1fr auto;gap:8px;align-items:center;margin-bottom:8px}
+.mnt-modelos .lin button{width:34px;height:38px;border-radius:9px;border:1px solid var(--line2);background:#161d28;color:var(--muted)}
+.mnt-imp-res{max-height:42vh;overflow:auto;font-size:12.5px}
+</style>
+<script>
+/* =====================================================================
+   MANUTENÇÃO PREVENTIVA POR QUILOMETRAGEM
+   - KM vem de kmAtual(), alimentado pelos motoristas (retirada, entrega,
+     abastecimento, calibragem) — ninguém precisa ligar para saber o KM.
+   - Trocas: aba "manutencoes" (campo preventiva = oleo | comando |
+     pneuDianteiro | pneuTraseiro). Exclusão é lógica (excluido = true).
+   - Intervalos da viatura: campos no próprio veículo (comando, motor,
+     intervalos). Intervalos padrão: aba "config". Histórico de alertas:
+     aba "alertas".
+   ===================================================================== */
+const MNT_CFG_ID="manutencaoPreventiva";
+const MNT_PADRAO={oleoCarro:10000,oleoMoto:1500,pneuDianteiro:50000,pneuTraseiro:50000,alertaKm:1000,
+  comandoModelos:[{modelo:"Mobi",marca:"Fiat",km:200000},{modelo:"Kwid",marca:"Renault",km:200000},{modelo:"Onix",marca:"Chevrolet",km:200000},
+    {modelo:"Palio",marca:"Fiat",km:50000},{modelo:"Gol",marca:"Volkswagen",km:50000}]};
+const MNT_ITENS=["oleo","comando","pneuDianteiro","pneuTraseiro"];
+const MNT_CURTO={oleo:"Óleo",comando:"Correia/corrente",pneuDianteiro:"Pneus diant.",pneuTraseiro:"Pneus tras."};
+const MNT_POS={DE:"Dianteiro esquerdo",DD:"Dianteiro direito",TE:"Traseiro esquerdo",TD:"Traseiro direito",D:"Dianteiro",T:"Traseiro"};
+const MNT_ST={vencida:{t:"Manutenção vencida",c:"red",em:"🔴"},proxima:{t:"Próxima manutenção",c:"orange",em:"🟡"},em_dia:{t:"Em dia",c:"green",em:"🟢"},
+  sem_registro:{t:"Sem registro",c:"gray",em:"⚪"},sem_intervalo:{t:"Sem intervalo",c:"gray",em:"⚪"},incompleta:{t:"Cadastro incompleto",c:"gray",em:"⚪"}};
+const MNT_ORD={vencida:0,proxima:1,em_dia:2,sem_intervalo:3,sem_registro:4};
+const MNT_ORIGEM={veiculo:"definido para esta viatura",padrao_carro:"padrão para carros",padrao_moto:"padrão para motos",padrao:"padrão da frota",modelo:"padrão do modelo"};
+const MNT_XLSX="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js";
+const MNT={hist:{de:"",ate:"",item:"",exc:false},rel:{de:"",ate:"",item:"",vid:""},f:{q:"",modelo:"",item:"",sit:"pendentes",ord:"urg"},imp:null};
+
+/* ---------- regras ---------- */
+function mntCfg(){
+  const c=(DB.config||[]).find(x=>x.id===MNT_CFG_ID)||{};
+  const o=Object.assign({},MNT_PADRAO);
+  ["oleoCarro","oleoMoto","pneuDianteiro","pneuTraseiro","alertaKm"].forEach(k=>{ if(c[k]!==undefined && c[k]!=="" && !isNaN(+c[k])) o[k]=+c[k]; });
+  if(Array.isArray(c.comandoModelos)) o.comandoModelos=c.comandoModelos;
+  return o;
+}
+const mntTk=s=>String(s||"").normalize("NFD").replace(/[\u0300-\u036f]/g,"").toLowerCase().match(/[a-z0-9]+/g)||[];
+const mntPlaca=p=>String(p||"").toUpperCase().replace(/[^A-Z0-9]/g,"");
+function mntAplicavel(v){ return !!v && !ehGerador(v); }
+function mntMoto(v){ return v && v.tipo==="Moto"; }
+function mntModeloComando(v,cfg){
+  const tk=mntTk([v.modelo,v.marca].join(" "));
+  const l=(cfg.comandoModelos||[]).slice().sort((a,b)=>mntTk(b.modelo).length-mntTk(a.modelo).length);
+  return l.find(m=>{const mt=mntTk(m.modelo); return mt.length && mt.every(t=>tk.includes(t));})||null;
+}
+function mntIntervalo(v,item,cfg){
+  const ov=+((v.intervalos||{})[item]);
+  if(ov>0) return {km:ov,origem:"veiculo"};
+  if(item==="oleo") return mntMoto(v)?{km:cfg.oleoMoto,origem:"padrao_moto"}:{km:cfg.oleoCarro,origem:"padrao_carro"};
+  if(item==="pneuDianteiro") return {km:cfg.pneuDianteiro,origem:"padrao"};
+  if(item==="pneuTraseiro") return {km:cfg.pneuTraseiro,origem:"padrao"};
+  const m=mntModeloComando(v,cfg); return m?{km:+m.km,origem:"modelo",modelo:m.modelo}:{km:null,origem:""};
+}
+function mntAlertaKm(v,cfg){ const a=(v.intervalos||{}).alertaKm; return a!==undefined && a!=="" && !isNaN(+a) && +a>=0 ? +a : cfg.alertaKm; }
+function mntNomeItem(item,v){
+  if(item==="comando") return v&&v.comando==="correia"?"Correia dentada":v&&v.comando==="corrente"?"Corrente de comando":"Correia/corrente de comando";
+  return {oleo:"Óleo do motor",pneuDianteiro:"Pneus dianteiros",pneuTraseiro:"Pneus traseiros"}[item]||item;
+}
+function mntPosicoes(v,item){
+  if(item!=="pneuDianteiro"&&item!=="pneuTraseiro") return null;
+  if(mntMoto(v)) return item==="pneuDianteiro"?["D"]:["T"];
+  return item==="pneuDianteiro"?["DE","DD"]:["TE","TD"];
+}
+/* Troca que vale para a preventiva (registros antigos do tipo "Óleo" contam como troca de óleo). */
+function mntItemDe(m){ if(!m||m.excluido) return null; if(MNT_ITENS.includes(m.preventiva)) return m.preventiva; return m.tipo==="Óleo"&&!m.preventiva?"oleo":null; }
+function mntData(d){ return d?dBR(d):"sem data"; }
+function mntRecente(regs){ let r=null; regs.forEach(x=>{ if(x.km==null||x.km===""||isNaN(+x.km)) return; if(!r||+x.km>+r.km||(+x.km===+r.km&&String(x.data||"")>String(r.data||""))) r=x; }); return r; }
+function mntCobre(m,pos,v){ const ps=String(m.posicoes||"").split(",").map(s=>s.trim()).filter(Boolean); return !ps.length||mntMoto(v)||ps.includes(pos)||ps.includes(pos[0]); }
+function mntStatusRest(rest,al){ return rest<=0?"vencida":rest<=al?"proxima":"em_dia"; }
+function mntKmDia(vid){
+  const lim=Date.now()-180*864e5;
+  const p=kmLeituras(vid).filter(l=>l.km>0&&tms(l.data)>=lim).map(l=>({t:tms(l.data),km:l.km})).sort((a,b)=>a.t-b.t);
+  if(p.length<2) return null; const dias=(p[p.length-1].t-p[0].t)/864e5, d=p[p.length-1].km-p[0].km;
+  return dias>=7&&d>0?d/dias:null;
+}
+function mntCalcItem(v,item,cfg,kmRef){
+  const regs=DB.manutencoes.filter(m=>m.veiculoId===v.id&&mntItemDe(m)===item);
+  const iv=mntIntervalo(v,item,cfg), al=mntAlertaKm(v,cfg), maxR=mntRecente(regs);
+  if(kmRef==null && maxR) kmRef=+maxR.km;
+  const res={item,nome:mntNomeItem(item,v),intervalo:iv.km,origem:iv.origem,modeloIv:iv.modelo||"",alertaKm:al,kmRef,ultima:null,proximaKm:null,restante:null,status:"sem_registro",posicoes:[],incompleto:false,regs:regs.length};
+  const pl=mntPosicoes(v,item);
+  if(pl){
+    let urg=null;
+    pl.forEach(pos=>{
+      const u=mntRecente(regs.filter(m=>mntCobre(m,pos,v)));
+      const p={pos,nome:MNT_POS[pos],ultima:u,proximaKm:null,restante:null,status:"sem_registro"};
+      if(u&&iv.km){ p.proximaKm=+u.km+iv.km; if(kmRef!=null){p.restante=p.proximaKm-kmRef;p.status=mntStatusRest(p.restante,al);} if(!urg||p.proximaKm<urg.proximaKm) urg=p; }
+      if(!u) res.incompleto=true;
+      res.posicoes.push(p);
+    });
+    if(urg){ Object.assign(res,{ultima:urg.ultima,proximaKm:urg.proximaKm,restante:urg.restante,status:urg.status}); }
+    else if(maxR) res.ultima=maxR;
+    if(pl.length===1) res.incompleto=false;
+  } else {
+    res.ultima=maxR;
+    if(maxR&&iv.km){ res.proximaKm=+maxR.km+iv.km; if(kmRef!=null){res.restante=res.proximaKm-kmRef;res.status=mntStatusRest(res.restante,al);} }
+  }
+  if(!iv.km) res.status="sem_intervalo";
+  if(res.ultima&&iv.km&&kmRef!=null&&res.proximaKm!=null) res.progresso=Math.max(0,(kmRef-(res.proximaKm-iv.km))/iv.km);
+  return res;
+}
+let _MNT_CACHE={t:0,m:new Map()};
+function mntInvalidar(){ _MNT_CACHE={t:Date.now(),m:new Map()}; }
+function mntCalc(vid){
+  if(Date.now()-_MNT_CACHE.t>1500) mntInvalidar();
+  if(_MNT_CACHE.m.has(vid)) return _MNT_CACHE.m.get(vid);
+  const v=veiculo(vid); if(!mntAplicavel(v)) return null;
+  const cfg=mntCfg(); const k=kmAtual(vid); const kmRef=k>0?k:null;
+  const itens=MNT_ITENS.map(i=>mntCalcItem(v,i,cfg,kmRef));
+  const st=itens.map(i=>i.status);
+  const situacao=st.includes("vencida")?"vencida":st.includes("proxima")?"proxima":(st.includes("sem_registro")||st.includes("sem_intervalo"))?"incompleta":"em_dia";
+  const r={v,kmAtual:kmRef,itens,situacao,kmDia:mntKmDia(vid),alertaKm:mntAlertaKm(v,cfg)};
+  _MNT_CACHE.m.set(vid,r); return r;
+}
+function mntFrota(){ return DB.veiculos.filter(mntAplicavel).map(v=>mntCalc(v.id)).filter(Boolean); }
+function mntSituacaoVeiculo(vid){ const c=mntCalc(vid); return c?c.situacao:""; }
+function mntContagem(){
+  const c={vencida:0,proxima:0,em_dia:0,sem:0,veic:new Set()};
+  mntFrota().forEach(x=>x.itens.forEach(i=>{ if(i.status==="vencida"||i.status==="proxima"){c[i.status]++;c.veic.add(x.v.id);} else if(i.status==="em_dia")c.em_dia++; else c.sem++; }));
+  return c;
+}
+function mntGastoMes(){ const l=DB.manutencoes.filter(m=>mntItemDe(m)&&isThisMonth(m.data)); return {total:l.reduce((s,m)=>s+(+m.valor||0),0),qtd:l.length}; }
+function mntRestTxt(i){ if(i.restante==null) return "—"; if(i.restante<0) return "excedido em "+fmtKm(-i.restante); if(i.restante===0) return "chegou na km da troca"; return "faltam "+fmtKm(i.restante); }
+function mntPrevData(rest,kmDia){ return kmDia&&rest>0?dBR(new Date(Date.now()+rest/kmDia*864e5).toISOString()):""; }
+function mntTag(st){ const s=MNT_ST[st]||MNT_ST.sem_registro; return `<span class="tag ${s.c}">${s.em} ${s.t}</span>`; }
+function mntPodeEditar(){ return typeof podeCorrigirCadastro==="function"&&podeCorrigirCadastro(); }
+function mntOdo(km){
+  if(km==null) return `<div class="mnt-odo" role="img" aria-label="Sem leitura">${"<span>–</span>".repeat(6)}<small>sem leitura</small></div>`;
+  const d=String(Math.round(km)).padStart(6,"0").split(""); let h="";
+  d.forEach((c,i)=>{ if(i>0&&(d.length-i)%3===0) h+='<span class="sep">.</span>'; h+=`<span>${c}</span>`; });
+  return `<div class="mnt-odo" role="img" aria-label="${fmtKm(km)}">${h}<small>km</small></div>`;
+}
+
+/* ---------- alertas (histórico na aba "alertas") ---------- */
+function mntSincronizarAlertas(ctx){
+  if(!SESSION||SESSION.tipo!=="admin"||!mntPodeEditar()) return;
+  DB.alertas=DB.alertas||[];
+  const agora=nowISO(), abertos=new Map(), mudou=new Set();
+  DB.alertas.forEach(a=>{ if(!a.encerradoEm) abertos.set(a.id,a); });
+  const ativos=new Set();
+  mntFrota().forEach(x=>x.itens.forEach(i=>{
+    if(i.status!=="vencida"&&i.status!=="proxima") return;
+    const id="al-"+x.v.id+"-"+i.item+"-"+i.proximaKm; ativos.add(id);
+    const st=i.status==="vencida"?"Vencida":"Próxima";
+    let a=DB.alertas.find(y=>y.id===id);
+    if(!a){ a={id,veiculoId:x.v.id,placa:x.v.placa,interno:x.v.interno,item:i.item,status:st,kmPrevisto:i.proximaKm,kmAtual:i.kmRef,abertoEm:agora,atualizadoEm:agora,encerradoEm:""}; DB.alertas.push(a); mudou.add(id); }
+    else if(a.encerradoEm||a.status!==st){ a.status=st; a.kmAtual=i.kmRef; a.atualizadoEm=agora; if(a.encerradoEm){a.encerradoEm="";a.reaberto=agora;} mudou.add(id); }
+  }));
+  abertos.forEach((a,id)=>{
+    if(ativos.has(id)) return;
+    const m=DB.manutencoes.filter(x=>x.veiculoId===a.veiculoId&&mntItemDe(x)===a.item&&String(x.registradoEm||x.data||"")>=String(a.abertoEm)).sort((p,q)=>String(q.registradoEm||"").localeCompare(String(p.registradoEm||"")))[0];
+    const doCtx=ctx&&ctx.veiculoId===a.veiculoId&&ctx.item===a.item;
+    a.encerradoEm=agora; a.atualizadoEm=agora;
+    a.motivoEncerramento=doCtx&&ctx.motivo?ctx.motivo:m?"Manutenção registrada":"Previsão recalculada";
+    a.manutencaoId=doCtx&&ctx.manutencaoId?ctx.manutencaoId:(m?m.id:"");
+    a.encerradoPor=SESSION.nome; mudou.add(id);
+  });
+  if(mudou.size) saveSync(["alertas"]);
+}
+let _mntAlTimer=null;
+function mntAgendarAlertas(){ clearTimeout(_mntAlTimer); _mntAlTimer=setTimeout(()=>{ try{mntSincronizarAlertas();}catch(e){console.warn("alertas preventiva:",e);} },400); }
+function mntAlertaDesde(vid,item){ const a=(DB.alertas||[]).find(x=>x.veiculoId===vid&&x.item===item&&!x.encerradoEm); return a?a.abertoEm:""; }
+/* entradas para a tela "Alertas" e para "Alertas recentes" do painel */
+function mntAlertasGerais(resumo){
+  const pend=[]; mntFrota().forEach(x=>x.itens.forEach(i=>{ if(i.status==="vencida"||i.status==="proxima") pend.push({x,i}); }));
+  pend.sort((a,b)=>(MNT_ORD[a.i.status]-MNT_ORD[b.i.status])||(a.i.restante-b.i.restante));
+  if(resumo){
+    const out=[], ven=pend.filter(p=>p.i.status==="vencida"), prox=pend.filter(p=>p.i.status==="proxima");
+    const lbl=p=>p.x.v.interno+" "+MNT_CURTO[p.i.item];
+    if(ven.length) out.push({level:"red",em:"🛠️",t:ven.length+" manutenção(ões) preventiva(s) vencida(s)",s:ven.slice(0,6).map(lbl).join(", ")+(ven.length>6?"…":"")+" — veja em Manutenção preventiva"});
+    if(prox.length) out.push({level:"yellow",em:"🛠️",t:prox.length+" troca(s) próxima(s) do vencimento",s:prox.slice(0,6).map(lbl).join(", ")+(prox.length>6?"…":"")});
+    return out;
+  }
+  return pend.map(p=>({level:p.i.status==="vencida"?"red":"yellow",em:"🛠️",t:p.i.nome+" — "+MNT_ST[p.i.status].t,s:p.x.v.interno+" · "+p.x.v.placa+" · "+mntRestTxt(p.i)+" (troca em "+fmtKm(p.i.proximaKm)+")"}));
+}
+function mntResumoMenu(){ const c=mntContagem(); return c.vencida||c.proxima?`${c.vencida} vencida(s) · ${c.proxima} próxima(s)`:"Óleo, correia/corrente e pneus por KM"; }
+function mntLinhaAviso(vid){
+  const c=mntCalc(vid); if(!c||(c.situacao!=="vencida"&&c.situacao!=="proxima")) return "";
+  const it=c.itens.filter(i=>i.status==="vencida"||i.status==="proxima");
+  return `<div class="s" style="color:${c.situacao==="vencida"?"var(--red)":"var(--orange)"};font-weight:700">🛠️ ${it.map(i=>esc(MNT_CURTO[i.item]+(i.status==="vencida"?" vencido":" próximo"))).join(" · ")}</div>`;
+}
+function mntAvisoMotorista(vid){
+  const c=mntCalc(vid); if(!c) return "";
+  const ven=c.itens.filter(i=>i.status==="vencida"); if(!ven.length) return "";
+  return `<div class="alert-item red" style="margin:6px 0 10px"><span class="em">🛠️</span><div class="txt"><div class="t">${ven.map(i=>esc(i.nome)).join(" e ")}: troca vencida</div>
+    <div class="s">Avise o gestor da frota. O KM que você informa na retirada e na entrega é o que mantém este controle em dia.</div></div></div>`;
+}
+
+/* ---------- painel principal ---------- */
+function mntBlocoPainel(){
+  if(!DB.veiculos.some(mntAplicavel)) return "";
+  mntAgendarAlertas();
+  const c=mntContagem(), g=mntGastoMes();
+  const pend=[]; mntFrota().forEach(x=>x.itens.forEach(i=>{ if(i.status==="vencida"||i.status==="proxima") pend.push({x,i}); }));
+  pend.sort((a,b)=>(MNT_ORD[a.i.status]-MNT_ORD[b.i.status])||(a.i.restante-b.i.restante));
+  return `<div class="section-title">🛠️ Central de Manutenção da Frota <span class="line"></span></div>
+    <div class="grid g4" onclick="go('preventiva')" style="cursor:pointer">
+      ${stat("🔴","Manutenções vencidas",c.vencida,c.vencida?"red":"green")}
+      ${stat("🟡","Próximas do vencimento",c.proxima,c.proxima?"orange":"green")}
+      ${stat("🚗","Veículos com pendência",c.veic.size,c.veic.size?"orange":"green")}
+      ${stat("🧾","Gasto preventivo no mês",fmtMoney(g.total),"gold")}
+    </div>
+    ${pend.length?`<div class="list" style="margin-top:10px">${pend.slice(0,4).map(p=>`<div class="alert-item ${p.i.status==="vencida"?"red":"yellow"}" onclick="go('veiculo-det','${p.x.v.id}')" style="cursor:pointer">
+      <span class="em">🛠️</span><div class="txt"><div class="t">${esc(p.x.v.interno)} · ${esc(p.x.v.placa)} — ${esc(p.i.nome)}</div>
+      <div class="s">KM ${fmtNum(p.i.kmRef)} · troca em ${fmtNum(p.i.proximaKm)} · ${mntRestTxt(p.i)}</div></div></div>`).join("")}</div>
+      ${pend.length>4?`<button class="btn sec sm" style="margin-top:8px" onclick="go('preventiva')">Ver todas (${pend.length})</button>`:""}`:""}`;
+}
+
+/* ---------- central ---------- */
+ROUTES.preventiva=(el)=>{
+  mntInvalidar(); mntAgendarAlertas();
+  const fr=mntFrota(), c=mntContagem(), g=mntGastoMes(), ed=mntPodeEditar();
+  const modelos=[...new Set(fr.map(x=>x.v.modelo||x.v.tipo).filter(Boolean))].sort((a,b)=>a.localeCompare(b,"pt-BR"));
+  const opt=(v,t,sel)=>`<option value="${esc(v)}" ${sel===v?"selected":""}>${esc(t)}</option>`;
+  el.innerHTML=`<div class="wrap">
+    <h2 class="page-title">🛠️ Manutenção preventiva <small>KM atualizado pelos motoristas em cada retirada, entrega e abastecimento</small></h2>
+    <div class="grid g3">
+      <div onclick="mntIrPara('frota')" style="cursor:pointer">${stat("🚗","Veículos controlados",fr.length,"")}</div>
+      <div onclick="mntFiltrarSit('em_dia')" style="cursor:pointer">${stat("🟢","Manutenções em dia",c.em_dia,"green")}</div>
+      <div onclick="mntFiltrarSit('proxima')" style="cursor:pointer">${stat("🟡","Próximas do vencimento",c.proxima,c.proxima?"orange":"")}</div>
+      <div onclick="mntFiltrarSit('vencida')" style="cursor:pointer">${stat("🔴","Manutenções vencidas",c.vencida,c.vencida?"red":"")}</div>
+      <div onclick="mntFiltrarSit('pendentes')" style="cursor:pointer">${stat("⚠️","Veículos com pendência",c.veic.size,c.veic.size?"orange":"")}</div>
+      <div onclick="mntIrPara('rel')" style="cursor:pointer">${stat("🧾","Gasto no mês",fmtMoney(g.total),"gold")}</div>
+    </div>
+    ${c.sem?`<div class="hint" style="margin-top:8px">${c.sem} item(ns) ainda sem registro de troca ou sem intervalo — complete na página de cada veículo.</div>`:""}
+    ${ed?`<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
+      <button class="btn sm sec" onclick="mntFormConfig()">⚙️ Intervalos padrão</button>
+      <button class="btn sm sec" onclick="mntFormImportar()">📥 Importar planilha</button></div>`:""}
+
+    <div class="section-title" id="mnt-pend-h">Pendências <span class="line"></span><small id="mnt-pend-n" style="color:var(--muted);font-weight:400"></small></div>
+    <div class="mnt-filtros">
+      <div><label for="mnt-q">Placa ou viatura</label><input id="mnt-q" placeholder="Ex.: FOT6A75 ou V-007" value="${esc(MNT.f.q)}"></div>
+      <div><label for="mnt-fm">Modelo</label><select id="mnt-fm">${opt("","Todos",MNT.f.modelo)}${modelos.map(m=>opt(m,m,MNT.f.modelo)).join("")}</select></div>
+      <div><label for="mnt-fi">Tipo de manutenção</label><select id="mnt-fi">${opt("","Todos",MNT.f.item)}${MNT_ITENS.map(i=>opt(i,mntNomeItem(i),MNT.f.item)).join("")}</select></div>
+      <div><label for="mnt-fo">Ordenar por</label><select id="mnt-fo">${opt("urg","Mais urgentes",MNT.f.ord)}${opt("placa","Placa",MNT.f.ord)}${opt("modelo","Modelo",MNT.f.ord)}${opt("item","Tipo",MNT.f.ord)}</select></div>
+    </div>
+    <div class="chips" id="mnt-chips">${[["pendentes","Vencidas e próximas"],["vencida","Vencidas"],["proxima","Próximas"],["em_dia","Em dia"],["sem","Sem registro"],["todas","Todas"]].map(([k,t])=>`<button class="${MNT.f.sit===k?"on":""}" data-s="${k}">${t}</button>`).join("")}</div>
+    <div class="list" id="mnt-pend"></div>
+
+    <div class="section-title" id="mnt-frota-h">Viaturas <span class="line"></span></div>
+    <div class="list">${fr.slice().sort((a,b)=>({vencida:0,proxima:1,incompleta:2,em_dia:3}[a.situacao]-{vencida:0,proxima:1,incompleta:2,em_dia:3}[b.situacao])||(a.v.interno||"").localeCompare(b.v.interno||"","pt-BR")).map(x=>`
+      <div class="row-item" onclick="go('veiculo-det','${x.v.id}')" style="cursor:pointer">
+        <div class="av">${mntMoto(x.v)?"🏍️":esc(String(x.v.interno||"").replace("V-",""))}</div>
+        <div class="main"><div class="t">${esc(x.v.interno)} · ${esc(x.v.placa)} ${x.v.modelo?`<span style="color:var(--muted);font-weight:400">· ${esc([x.v.marca,x.v.modelo].filter(Boolean).join(" "))}</span>`:""}</div>
+          <div class="s">${x.kmAtual!=null?"KM "+fmtNum(x.kmAtual):"sem leitura de KM"} · ${x.itens.map(i=>`${MNT_ST[i.status].em} ${MNT_CURTO[i.item]}`).join("  ")}</div></div>
+        <div class="act">${mntTag(x.situacao)}</div></div>`).join("")||'<div class="empty"><div class="em">🚗</div>Nenhuma viatura cadastrada</div>'}</div>
+
+    <div class="section-title" id="mnt-rel-h">Histórico e relatórios <span class="line"></span></div>
+    <div class="mnt-filtros">
+      <div><label for="mnt-rde">De</label><input type="date" id="mnt-rde" value="${MNT.rel.de}"></div>
+      <div><label for="mnt-rate">Até</label><input type="date" id="mnt-rate" value="${MNT.rel.ate}"></div>
+      <div><label for="mnt-ri">Tipo</label><select id="mnt-ri">${opt("","Todos",MNT.rel.item)}${MNT_ITENS.map(i=>opt(i,mntNomeItem(i),MNT.rel.item)).join("")}</select></div>
+      <div><label for="mnt-rv">Viatura</label><select id="mnt-rv">${opt("","Todas",MNT.rel.vid)}${fr.map(x=>opt(x.v.id,x.v.interno+" · "+x.v.placa,MNT.rel.vid)).join("")}</select></div>
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap">
+      <button class="btn sm" onclick="mntExportar('pdf')">📄 PDF</button><button class="btn sm blue" onclick="mntExportar('xls')">⬇ Excel</button></div>
+    <div id="mnt-rel"></div>
+  </div>`;
+  const bind=(id,k,ev,fn)=>{ $("#"+id).addEventListener(ev||"change",e=>{ k(e.target.value); fn(); }); };
+  bind("mnt-q",v=>MNT.f.q=v,"input",mntRenderPend); bind("mnt-fm",v=>MNT.f.modelo=v,null,mntRenderPend);
+  bind("mnt-fi",v=>MNT.f.item=v,null,mntRenderPend); bind("mnt-fo",v=>MNT.f.ord=v,null,mntRenderPend);
+  $$("#mnt-chips button").forEach(b=>b.onclick=()=>{ MNT.f.sit=b.dataset.s; $$("#mnt-chips button").forEach(x=>x.classList.toggle("on",x===b)); mntRenderPend(); });
+  bind("mnt-rde",v=>MNT.rel.de=v,null,mntRenderRel); bind("mnt-rate",v=>MNT.rel.ate=v,null,mntRenderRel);
+  bind("mnt-ri",v=>MNT.rel.item=v,null,mntRenderRel); bind("mnt-rv",v=>MNT.rel.vid=v,null,mntRenderRel);
+  mntRenderPend(); mntRenderRel();
+};
+function mntIrPara(s){ const el=$(s==="rel"?"#mnt-rel-h":"#mnt-frota-h"); if(s==="rel"){ const h=localD(); MNT.rel.de=h.slice(0,8)+"01"; MNT.rel.ate=h; $("#mnt-rde").value=MNT.rel.de; $("#mnt-rate").value=h; mntRenderRel(); } if(el) el.scrollIntoView({behavior:"smooth",block:"start"}); }
+function mntFiltrarSit(s){ MNT.f.sit=s; $$("#mnt-chips button").forEach(x=>x.classList.toggle("on",x.dataset.s===s)); mntRenderPend(); $("#mnt-pend-h").scrollIntoView({behavior:"smooth",block:"start"}); }
+function mntRenderPend(){
+  const box=$("#mnt-pend"); if(!box) return;
+  const q=mntPlaca(MNT.f.q), qn=String(MNT.f.q||"").trim().toLowerCase();
+  let l=[]; mntFrota().forEach(x=>x.itens.forEach(i=>l.push({x,i})));
+  l=l.filter(({x,i})=>{
+    if(qn && !(mntPlaca(x.v.placa).includes(q)||String(x.v.interno||"").toLowerCase().includes(qn))) return false;
+    if(MNT.f.modelo && (x.v.modelo||x.v.tipo)!==MNT.f.modelo) return false;
+    if(MNT.f.item && i.item!==MNT.f.item) return false;
+    const s=MNT.f.sit;
+    if(s==="pendentes") return i.status==="vencida"||i.status==="proxima";
+    if(s==="sem") return i.status==="sem_registro"||i.status==="sem_intervalo";
+    return s==="todas"||i.status===s;
+  });
+  const urg=(a,b)=>(MNT_ORD[a.i.status]-MNT_ORD[b.i.status])||((a.i.restante??1e12)-(b.i.restante??1e12));
+  const tx=(a,b)=>String(a).localeCompare(String(b),"pt-BR");
+  l.sort((a,b)=>MNT.f.ord==="placa"?tx(a.x.v.placa,b.x.v.placa)||urg(a,b):MNT.f.ord==="modelo"?tx(a.x.v.modelo||"",b.x.v.modelo||"")||urg(a,b):MNT.f.ord==="item"?(MNT_ITENS.indexOf(a.i.item)-MNT_ITENS.indexOf(b.i.item))||urg(a,b):urg(a,b));
+  $("#mnt-pend-n").textContent=l.length+" item(ns)";
+  box.innerHTML=l.length?l.map(({x,i})=>`<div class="row-item">
+    <div class="av">${MNT_ST[i.status].em}</div>
+    <div class="main"><div class="t">${esc(x.v.interno)} · ${esc(x.v.placa)}${x.v.modelo?" · "+esc(x.v.modelo):""} — ${esc(i.nome)}</div>
+      <div class="s">KM atual <b>${i.kmRef!=null?fmtNum(i.kmRef):"—"}</b> · troca prevista <b>${i.proximaKm!=null?fmtNum(i.proximaKm):"—"}</b> · <b style="color:${i.status==="vencida"?"var(--red)":i.status==="proxima"?"var(--orange)":"inherit"}">${mntRestTxt(i)}</b></div>
+      <div class="s">Última manutenção: ${i.ultima?mntData(i.ultima.data)+" com "+fmtKm(i.ultima.km):"não registrada"}</div></div>
+    <div class="act">${mntTag(i.status)}<button class="btn sm sec" style="width:auto" onclick="go('veiculo-det','${x.v.id}')">Ficha</button></div></div>`).join("")
+    :`<div class="empty"><div class="em">👍</div>${MNT.f.sit==="pendentes"?"Nenhuma manutenção pendente para os filtros escolhidos":"Nenhum item encontrado"}</div>`;
+}
+function mntFiltrarRegs(f){
+  const de=f.de?new Date(f.de+"T00:00:00"):null, ate=f.ate?new Date(f.ate+"T23:59:59"):null;
+  return DB.manutencoes.filter(m=>{
+    const it=m.preventiva&&MNT_ITENS.includes(m.preventiva)?m.preventiva:(m.tipo==="Óleo"?"oleo":null);
+    if(!it) return false;
+    if(!f.exc&&m.excluido) return false;
+    if(f.vid&&m.veiculoId!==f.vid) return false;
+    if(f.item&&it!==f.item) return false;
+    if(de||ate){ if(!m.data) return false; const d=new Date(m.data); if(de&&d<de) return false; if(ate&&d>ate) return false; }
+    return true;
+  }).sort((a,b)=>String(b.data||"").localeCompare(String(a.data||""))||(+b.km||0)-(+a.km||0));
+}
+function mntServico(m){
+  const v=veiculo(m.veiculoId), it=m.preventiva||"oleo";
+  let n=mntNomeItem(it,v);
+  const ps=String(m.posicoes||"").split(",").filter(Boolean);
+  if((it==="pneuDianteiro"||it==="pneuTraseiro")&&ps.length===1&&ps[0].length===2) n+=ps[0].endsWith("E")?" (só o pneu esquerdo)":" (só o pneu direito)";
+  if(m.descricao) n+=": "+m.descricao;
+  return n;
+}
+function mntTabelaRegs(regs,comViatura,comExcluir){
+  if(!regs.length) return '<div class="empty"><div class="em">🧾</div>Nenhuma troca registrada no filtro escolhido</div>';
+  const validos=regs.filter(m=>!m.excluido), total=validos.reduce((s,m)=>s+(+m.valor||0),0);
+  return `<div class="table-wrap"><table><thead><tr><th>Data</th>${comViatura?"<th>Viatura</th>":""}<th>Serviço</th><th style="text-align:right">KM</th><th>Oficina / responsável</th><th style="text-align:right">Custo</th><th>Observações</th>${comExcluir?"<th></th>":""}</tr></thead>
+    <tbody>${regs.map(m=>{const v=veiculo(m.veiculoId);
+      return `<tr class="${m.excluido?"mnt-exc":""}"><td>${mntData(m.data)}</td>${comViatura?`<td>${esc(v?v.interno+" · "+v.placa:"—")}</td>`:""}
+      <td>${esc(mntServico(m))}${m.nf?` <a href="${esc(m.nf)}" target="_blank" rel="noopener" title="Comprovante">📎</a>`:""}${m.foto?` <button class="btn sm sec" style="width:auto;padding:2px 8px" onclick="mntVerFoto('${m.id}')" title="Ver foto da nota">🖼️</button>`:""}</td>
+      <td style="text-align:right">${m.km!==""&&m.km!=null?fmtNum(m.km):"—"}</td><td>${esc(m.oficina||"—")}</td>
+      <td style="text-align:right">${m.valor?fmtMoney(m.valor):"—"}</td><td>${esc(m.obs||"")}${m.origem?`<div class="hint">${esc(m.origem)}</div>`:""}</td>
+      ${comExcluir?`<td>${m.excluido?`<span class="hint">Excluído: ${esc(m.motivoExclusao||"")}</span>`:(mntPodeEditar()?`<button class="btn sm sec" style="width:auto;padding:4px 10px" onclick="mntFormExcluir('${m.id}')">Excluir</button>`:"")}</td>`:""}</tr>`;}).join("")}</tbody>
+    <tfoot><tr><td colspan="${comViatura?5:4}" style="font-weight:700">Total gasto (${validos.length} registro(s))</td><td style="text-align:right;font-weight:700">${fmtMoney(total)}</td><td colspan="${comExcluir?2:1}"></td></tr></tfoot></table></div>`;
+}
+function mntRenderRel(){
+  const box=$("#mnt-rel"); if(!box) return;
+  if(MNT.rel.de&&MNT.rel.ate&&MNT.rel.de>MNT.rel.ate){ box.innerHTML='<div class="err">A data "De" está depois da data "Até".</div>'; return; }
+  const regs=mntFiltrarRegs(MNT.rel), por=new Map();
+  regs.forEach(m=>{ const v=veiculo(m.veiculoId); const t=por.get(m.veiculoId)||{n:v?v.interno+" · "+v.placa:"—",q:0,t:0}; t.q++; t.t+=+m.valor||0; por.set(m.veiculoId,t); });
+  const tot=[...por.values()].sort((a,b)=>b.t-a.t);
+  box.innerHTML=(tot.length?`<div class="chips" style="margin-bottom:10px">${tot.slice(0,10).map(t=>`<span class="tag gold">${esc(t.n)}: ${fmtMoney(t.t)}</span>`).join("")}</div>`:"")+mntTabelaRegs(regs.slice(0,300),true,false)+(regs.length>300?`<div class="hint">Mostrando 300 de ${regs.length}. O arquivo exportado traz todos.</div>`:"");
+}
+function mntLinhasExport(regs){ return regs.map(m=>{const v=veiculo(m.veiculoId); return {"Data":mntData(m.data),"Viatura":v?v.interno:"","Placa":v?v.placa:(m.placa||""),"Serviço":mntServico(m),"KM":m.km===""||m.km==null?"":+m.km,"Oficina / responsável":m.oficina||"","Custo (R$)":+m.valor||0,"Observações":m.obs||"","Origem":m.origem||"","Situação":m.excluido?"Excluído: "+(m.motivoExclusao||""):"Válido"};}); }
+function mntCarregarXLSX(){ return new Promise((ok,falha)=>{ if(window.XLSX) return ok(); const s=document.createElement("script"); s.src=MNT_XLSX; s.onload=()=>ok(); s.onerror=()=>falha(new Error("Não foi possível carregar o leitor de Excel. Confira a internet.")); document.head.appendChild(s); }); }
+async function mntExportar(tipo,vid){
+  const f=vid?Object.assign({},MNT.hist,{vid}):MNT.rel;
+  const regs=mntFiltrarRegs(f); if(!regs.length){ toast("Nenhuma troca no filtro para exportar"); return; }
+  const v=vid?veiculo(vid):null, base=(v?"Manutencao_"+mntPlaca(v.placa):"Manutencao_preventiva")+"_"+localD();
+  const linhas=mntLinhasExport(regs);
+  if(tipo==="pdf"){
+    if(!window.jspdf){ toast("O gerador de PDF não carregou. Confira a internet."); return; }
+    const {jsPDF}=window.jspdf, doc=new jsPDF({orientation:"landscape"});
+    doc.setFontSize(16);doc.setTextColor(40);doc.text("VEGAS FROTA",14,18);
+    doc.setFontSize(11);doc.setTextColor(90);doc.text(v?`Manutenção preventiva — ${v.interno} · ${v.placa}`:"Relatório de manutenção preventiva",14,26);
+    doc.setFontSize(8);doc.text(`Período: ${f.de?dBR(f.de+"T12:00"):"início"} a ${f.ate?dBR(f.ate+"T12:00"):"hoje"}${f.item?" · "+mntNomeItem(f.item):""} · gerado em ${dtBR(nowISO())} por ${SESSION?SESSION.nome:"—"}`,14,32);
+    const head=Object.keys(linhas[0]).filter(k=>k!=="Origem");
+    doc.autoTable({head:[head],body:linhas.map(l=>head.map(k=>k==="Custo (R$)"?(l[k]?fmtMoney(l[k]):""):k==="KM"&&l[k]!==""?fmtNum(l[k]):String(l[k]))),startY:38,styles:{fontSize:8},headStyles:{fillColor:[23,28,36],textColor:[235,239,244]}});
+    const tot=regs.filter(m=>!m.excluido).reduce((s,m)=>s+(+m.valor||0),0);
+    doc.setFontSize(10);doc.setTextColor(40);doc.text("Total gasto: "+fmtMoney(tot),14,doc.lastAutoTable.finalY+8);
+    doc.save(base+".pdf"); toast("PDF gerado"); return;
+  }
+  try{ await mntCarregarXLSX(); }catch(e){}
+  if(window.XLSX){
+    const wb=XLSX.utils.book_new(), ws=XLSX.utils.json_to_sheet(linhas);
+    ws["!cols"]=[11,10,10,42,10,26,12,36,22,22].map(w=>({wch:w}));
+    XLSX.utils.book_append_sheet(wb,ws,"Trocas");
+    const por=new Map(); regs.filter(m=>!m.excluido).forEach(m=>{const vv=veiculo(m.veiculoId); const k=m.veiculoId; const t=por.get(k)||{"Viatura":vv?vv.interno:"","Placa":vv?vv.placa:"","Registros":0,"Gasto (R$)":0}; t.Registros++; t["Gasto (R$)"]+=+m.valor||0; por.set(k,t);});
+    XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet([...por.values()]),"Gastos por viatura");
+    XLSX.writeFile(wb,base+".xlsx"); toast("Excel gerado"); return;
+  }
+  const cols=Object.keys(linhas[0]);
+  const csv="\ufeff"+[cols.join(";"),...linhas.map(l=>cols.map(c=>typeof l[c]==="number"?String(l[c]).replace(".",","):`"${String(l[c]).replace(/"/g,'""')}"`).join(";"))].join("\r\n");
+  const a=document.createElement("a"); a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv;charset=utf-8"})); a.download=base+".csv"; a.click();
+  toast("Sem acesso ao gerador de Excel: salvo em CSV (abre no Excel)");
+}
+async function mntVerFoto(id){
+  const m=DB.manutencoes.find(x=>x.id===id); if(!m||!m.foto) return;
+  openModal("Nota fiscal / comprovante",'<div id="mnt-foto"><div class="empty">Carregando…</div></div>');
+  const url=await photoGet(m.foto); const b=$("#mnt-foto");
+  if(b) b.innerHTML=url?`<img src="${url}" style="width:100%;border-radius:12px">`:'<div class="empty">Foto salva só no aparelho que fez o registro.</div>';
+}
+
+/* ---------- seção na página do veículo (ficha) ---------- */
+function mntSecaoVeiculo(id){
+  const v=veiculo(id); if(!mntAplicavel(v)) return "";
+  mntInvalidar(); mntAgendarAlertas();
+  const c=mntCalc(id), ed=mntPodeEditar(), opt=(val,t,sel)=>`<option value="${val}" ${sel===val?"selected":""}>${esc(t)}</option>`;
+  const ult=kmLeituras(id).filter(l=>l.km>0).slice(-1)[0];
+  const prox=c.itens.filter(i=>i.proximaKm!=null).sort((a,b)=>a.restante-b.restante);
+  setTimeout(()=>{ mntRenderHistVeic(id);
+    ["mnt-hde","mnt-hate","mnt-hit"].forEach(k=>{ const e=$("#"+k); if(e) e.onchange=()=>{ MNT.hist={de:$("#mnt-hde").value,ate:$("#mnt-hate").value,item:$("#mnt-hit").value,exc:$("#mnt-hexc").checked}; mntRenderHistVeic(id); }; });
+    const e=$("#mnt-hexc"); if(e) e.onchange=()=>{ MNT.hist.exc=e.checked; mntRenderHistVeic(id); };
+  },0);
+  return `<div class="section-title">🛠️ Manutenção preventiva <span class="line"></span>${mntTag(c.situacao)}</div>
+    <div class="card" style="margin-bottom:12px;display:flex;flex-wrap:wrap;gap:14px 22px;align-items:center">
+      <div><div class="hint" style="margin:0 0 6px">Quilometragem atual</div>${mntOdo(c.kmAtual)}</div>
+      <div style="font-size:12.5px;color:var(--muted);line-height:1.55">Última atualização<br><b style="color:var(--txt)">${ult?dtBR(ult.data):(v.kmEm?dtBR(v.kmEm):"—")}</b>${ult?`<br>${esc(ult.evento)} · ${esc(ult.motorista)}`:""}${c.kmDia?`<br>Média recente: ${fmtNum(Math.round(c.kmDia))} km/dia`:""}</div>
+      <div style="margin-left:auto;display:flex;gap:8px;flex-wrap:wrap">
+        ${ed?`<button class="btn sm sec" onclick="mntFormLeitura('${id}')">🛣️ Lançar leitura de KM</button><button class="btn sm sec" onclick="mntFormCadastro('${id}')">⚙️ Cadastro e intervalos</button>`:""}</div>
+      <div class="hint" style="flex-basis:100%;margin:0">Marca ${esc(v.marca||"—")} · modelo ${esc(v.modelo||"—")} · ano ${esc(v.ano||"—")} · motor ${esc(v.motor||"—")} · sistema de comando: <b>${v.comando==="correia"?"correia dentada":v.comando==="corrente"?"corrente de comando":"não informado"}</b></div>
+    </div>
+    <div class="mnt-itens">${c.itens.map(i=>mntCardItem(v,i,c,ed)).join("")}</div>
+    <div class="section-title" style="font-size:15px">Próximas manutenções previstas <span class="line"></span></div>
+    ${prox.length?`<div class="list">${prox.map(i=>{const pd=mntPrevData(i.restante,c.kmDia);
+      return `<div class="row-item"><div class="av">${MNT_ST[i.status].em}</div><div class="main"><div class="t">${esc(i.nome)} — em ${fmtKm(i.proximaKm)}</div>
+        <div class="s">${mntRestTxt(i)}${pd?" · por volta de "+pd:""}</div></div><div class="act">${mntTag(i.status)}</div></div>`;}).join("")}</div>`
+      :'<div class="empty" style="padding:16px">Registre a última troca de cada item para ver as previsões.</div>'}
+    <div class="section-title" style="font-size:15px">Histórico de manutenções preventivas <span class="line"></span></div>
+    <div class="mnt-filtros">
+      <div><label for="mnt-hde">De</label><input type="date" id="mnt-hde" value="${MNT.hist.de}"></div>
+      <div><label for="mnt-hate">Até</label><input type="date" id="mnt-hate" value="${MNT.hist.ate}"></div>
+      <div><label for="mnt-hit">Tipo</label><select id="mnt-hit">${opt("","Todos",MNT.hist.item)}${MNT_ITENS.map(i=>opt(i,mntNomeItem(i,v),MNT.hist.item)).join("")}</select></div>
+      <div style="display:flex;gap:8px;align-items:flex-end"><button class="btn sm" onclick="mntExportar('pdf','${id}')">📄 PDF</button><button class="btn sm blue" onclick="mntExportar('xls','${id}')">⬇ Excel</button></div>
+    </div>
+    <label style="display:flex;align-items:center;gap:8px;margin:0 0 10px"><input type="checkbox" id="mnt-hexc" style="width:auto" ${MNT.hist.exc?"checked":""}> Mostrar registros excluídos (auditoria)</label>
+    <div id="mnt-hist"></div>`;
+}
+function mntRenderHistVeic(id){ const b=$("#mnt-hist"); if(!b) return;
+  if(MNT.hist.de&&MNT.hist.ate&&MNT.hist.de>MNT.hist.ate){ b.innerHTML='<div class="err">A data "De" está depois da data "Até".</div>'; return; }
+  b.innerHTML=mntTabelaRegs(mntFiltrarRegs(Object.assign({},MNT.hist,{vid:id})),false,true); }
+function mntCardItem(v,i,c,ed){
+  const st=i.status, u=i.ultima;
+  const iv=i.intervalo?`A cada ${fmtKm(i.intervalo)}, ${MNT_ORIGEM[i.origem]||""}${i.modeloIv?" "+esc(i.modeloIv):""}`:"Intervalo não configurado";
+  let dest;
+  if(st==="sem_intervalo") dest='<div class="i-rest" style="font-size:18px">Sem previsão de troca</div>';
+  else if(st==="sem_registro") dest='<div class="i-rest" style="font-size:18px">Nenhuma troca registrada</div>';
+  else if(i.restante<0) dest=`<div class="i-rest">Excedido em ${fmtNum(-i.restante)}<small>km</small></div>`;
+  else if(i.restante===0) dest='<div class="i-rest">Chegou na km da troca</div>';
+  else dest=`<div class="i-rest">Faltam ${fmtNum(i.restante)}<small>km</small></div>`;
+  const pct=i.progresso!=null?Math.min(100,Math.round(i.progresso*100)):null;
+  const pd=mntPrevData(i.restante,c.kmDia);
+  const notas=[];
+  if(i.item==="comando"&&!v.comando) notas.push('<div class="mnt-nota neutra">O cadastro não diz se o motor usa correia ou corrente. Confirme no manual e informe em "Cadastro e intervalos".</div>');
+  if(st==="sem_intervalo") notas.push('<div class="mnt-nota">Informe o modelo do veículo ou defina o intervalo em "Cadastro e intervalos".</div>');
+  if(st==="sem_registro") notas.push('<div class="mnt-nota neutra">Registre a última troca feita para o sistema calcular a próxima.</div>');
+  if(u&&i.kmRef!=null&&+u.km>i.kmRef) notas.push(`<div class="mnt-nota">A última troca foi registrada com ${fmtKm(u.km)}, acima do KM atual. Confira os valores.</div>`);
+  if(u&&u.kmNaoConta&&u.origem) notas.push(`<div class="mnt-nota neutra">${esc(u.origem)}${/APROXIMADO/.test(u.obs||"")?" · km aproximado, confirme":""}</div>`);
+  const desde=(st==="vencida"||st==="proxima")?mntAlertaDesde(v.id,i.item):"";
+  if(desde) notas.push(`<div class="mnt-nota">Alerta aberto em ${dtBR(desde)}. Continua visível até a troca ser registrada.</div>`);
+  let pos="";
+  if(i.posicoes.length>1){ const ids=new Set(i.posicoes.map(p=>p.ultima?p.ultima.id:"")); if(ids.size>1||(i.incompleto&&u))
+    pos=`<div class="mnt-pos">${i.posicoes.map(p=>`<div><span>${p.nome}</span><span>${p.ultima?`troca com ${fmtKm(p.ultima.km)}, próxima ${fmtKm(p.proximaKm)}`:"sem registro"}</span></div>`).join("")}</div>`; }
+  return `<div class="card mnt-item ${st}">
+    <div class="i-top"><div><h4>${esc(i.nome)}</h4><div class="i-int">${iv}</div></div>${mntTag(st)}</div>
+    ${dest}${pct!=null?`<div class="mnt-bar" role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100" aria-label="Parte do intervalo já rodada"><div style="width:${pct}%"></div></div>`:""}
+    <dl class="mnt-dl"><dt>Última troca</dt><dd>${u?mntData(u.data):"—"}</dd><dt>KM da troca</dt><dd>${u?fmtKm(u.km):"—"}</dd>
+      <dt>Próxima troca</dt><dd>${i.proximaKm!=null?fmtKm(i.proximaKm):"—"}</dd>${pd?`<dt>Data estimada</dt><dd>por volta de ${pd}</dd>`:""}</dl>
+    ${pos}${notas.join("")}
+    ${ed?`<button class="btn sm ${["vencida","proxima","sem_registro"].includes(st)?"":"sec"}" style="align-self:flex-start;margin-top:auto" onclick="mntFormTroca('${v.id}','${i.item}')">Registrar troca/manutenção</button>`:""}
+  </div>`;
+}
+
+/* ---------- registrar troca ---------- */
+function mntFormTroca(vid,item){
+  const v=veiculo(vid); if(!v) return;
+  const k=kmAtual(vid); window._mntVid=vid;
+  openModal("Registrar troca/manutenção",`
+    <div class="hint" style="margin-top:0">${esc(v.interno)} · ${esc(v.placa)} · KM atual ${k?fmtKm(k):"sem leitura"}</div>
+    <label for="mp-item">Tipo de manutenção</label><select id="mp-item" onchange="mntTrocaCampos()">${MNT_ITENS.map(i=>`<option value="${i}" ${i===item?"selected":""}>${esc(mntNomeItem(i,v))}</option>`).join("")}</select>
+    <div id="mp-posbox"><label>Pneus trocados</label><div class="mnt-chk-pos" id="mp-pos"></div><div class="hint">Desmarque um lado para registrar a troca de um pneu só. O outro eixo não é alterado.</div></div>
+    <div class="two"><div><label for="mp-data">Data da troca</label><input id="mp-data" type="date" value="${localD()}" max="${localD()}"></div>
+      <div><label for="mp-km">KM no momento da troca</label><input id="mp-km" type="number" inputmode="numeric" min="0" value="${k||""}" oninput="mntTrocaPrev()"></div></div>
+    <label for="mp-desc">Detalhes do serviço (opcional)</label><input id="mp-desc" maxlength="300" placeholder="Ex.: óleo 5W30 sintético + filtro">
+    <div class="two"><div><label for="mp-valor">Valor gasto (R$, opcional)</label><input id="mp-valor" type="number" step="0.01" min="0" inputmode="decimal"></div>
+      <div><label for="mp-of">Oficina ou responsável (opcional)</label><input id="mp-of" maxlength="200"></div></div>
+    <label for="mp-obs">Observações</label><textarea id="mp-obs" maxlength="1000"></textarea>
+    <label for="mp-nf">Nota fiscal ou comprovante (link, opcional)</label><input id="mp-nf" placeholder="Cole o link ou tire a foto abaixo">
+    ${photoSlotHTML("mpfoto","Foto da nota","🧾")}
+    <div class="mnt-prev" id="mp-prev" aria-live="polite"></div>
+    <div class="err" id="mp-err" role="alert"></div>
+    <div class="wizard-nav"><button class="btn sec" onclick="closeModal()">Cancelar</button>
+      <button class="btn" onclick="salvarComBotao(this,()=>mntSalvarTroca('${vid}'))">Salvar registro</button></div>`);
+  window._mpfoto=null; bindPhotoKey("mpfoto",u=>{window._mpfoto=u;});
+  mntTrocaCampos();
+}
+function mntTrocaCampos(){
+  const v=veiculo(window._mntVid); if(!v) return;
+  const pos=mntPosicoes(v,$("#mp-item").value), mostrar=!!(pos&&pos.length>1);
+  $("#mp-posbox").style.display=mostrar?"":"none";
+  $("#mp-pos").innerHTML=mostrar?pos.map(p=>`<label><input type="checkbox" value="${p}" checked onchange="mntTrocaPrev()"> ${MNT_POS[p]}</label>`).join(""):"";
+  mntTrocaPrev();
+}
+function mntTrocaPrev(){
+  const v=veiculo(window._mntVid); if(!v) return;
+  const item=$("#mp-item").value, c=mntCalc(v.id), it=c?c.itens.find(i=>i.item===item):null;
+  const s=$("#mp-km").value.trim(), km=/^\d+$/.test(s)?+s:NaN, k=kmAtual(v.id);
+  let t;
+  if(!it||!it.intervalo) t="Sem intervalo configurado para este item: o registro entra no histórico, mas não gera previsão.";
+  else if(isNaN(km)) t=`Intervalo de ${fmtKm(it.intervalo)}. Informe o KM para ver a próxima troca.`;
+  else {
+    t=`Próxima troca prevista: <b>${fmtKm(km+it.intervalo)}</b> (${fmtKm(km)} + intervalo de ${fmtKm(it.intervalo)}).`;
+    if(it.posicoes.length>1){ const marc=$$("#mp-pos input:checked").map(x=>x.value); const outras=it.posicoes.filter(p=>!marc.includes(p.pos)&&p.proximaKm!=null);
+      if(outras.length) t+=` ${outras.map(p=>p.nome).join(" e ")} continua com previsão em ${fmtKm(Math.min(...outras.map(p=>p.proximaKm)))}.`; }
+    if(it.ultima&&km<+it.ultima.km) t+=` A última troca registrada foi com ${fmtKm(it.ultima.km)}: este registro entra no histórico e a previsão atual não muda.`;
+    if(k&&km>k) t+=` Isso também atualiza o KM da viatura de ${fmtKm(k)} para ${fmtKm(km)}${km-k>15000?" — <b style=\"color:var(--orange)\">confira, são "+fmtKm(km-k)+" a mais que o último registro</b>":""}.`;
+  }
+  $("#mp-prev").innerHTML=t;
+}
+async function mntSalvarTroca(vid){
+  const v=veiculo(vid), err=$("#mp-err"); err.textContent="";
+  const item=$("#mp-item").value, data=$("#mp-data").value, s=$("#mp-km").value.trim(), val=$("#mp-valor").value.trim();
+  const pos=$("#mp-posbox").style.display==="none"?(mntPosicoes(v,item)||[]):$$("#mp-pos input:checked").map(x=>x.value);
+  if(!data){ err.textContent="Informe a data da troca."; return; }
+  if(data>localD()){ err.textContent="A data da troca não pode estar no futuro."; return; }
+  if(!/^\d+$/.test(s)){ err.textContent="Informe o KM do veículo no momento da troca (somente números)."; return; }
+  if(val&&(isNaN(+val)||+val<0)){ err.textContent="Valor gasto inválido."; return; }
+  if(mntPosicoes(v,item)&&!pos.length){ err.textContent="Marque pelo menos um pneu trocado."; return; }
+  const km=+s, it=mntCalc(vid).itens.find(i=>i.item===item), id=uid("mp");
+  let foto=null; if(window._mpfoto){ foto=await photoPut(id+"_f",window._mpfoto); }
+  const tipo={oleo:"Óleo",comando:mntNomeItem("comando",v),pneuDianteiro:"Pneus dianteiros",pneuTraseiro:"Pneus traseiros"}[item];
+  const reg={id,veiculoId:vid,placa:v.placa,veiculoInterno:v.interno,preventiva:item,tipo,posicoes:pos.join(","),
+    data:data===localD()?nowISO():dataInputISO(data),km,descricao:$("#mp-desc").value.trim(),oficina:$("#mp-of").value.trim(),
+    valor:val?Math.round(+val*100)/100:0,obs:$("#mp-obs").value.trim(),nf:$("#mp-nf").value.trim(),foto,
+    intervaloAplicado:it&&it.intervalo||"",proximaKm:it&&it.intervalo?km+it.intervalo:"",
+    registradoPor:SESSION.nome,registradoPorId:SESSION.id,registradoEm:nowISO()};
+  DB.manutencoes.push(reg);
+  const abas=["manutencoes","auditoria"];
+  if(km>(+v.km||0)&&km>kmAtual(vid)){ v.km=km; v.kmEm=reg.data; abas.push("veiculos"); }
+  log("Registrou troca (preventiva)",v.interno+" · "+mntNomeItem(item,v)+" · KM "+fmtNum(km)+(pos.length&&pos.length<(mntPosicoes(v,item)||[]).length?" · "+pos.join(","):""));
+  window._mpfoto=null; mntInvalidar();
+  try{ mntSincronizarAlertas({veiculoId:vid,item,manutencaoId:id,motivo:"Manutenção registrada"}); }catch(e){}
+  saveSync(abas); closeModal();
+  toast(it&&it.ultima&&km<+it.ultima.km?"Registro salvo no histórico (troca anterior à última registrada).":it&&it.intervalo?`Troca registrada. Próxima prevista: ${fmtKm(km+it.intervalo)}.`:"Troca registrada.","ok");
+  go("veiculo-det",vid);
+}
+
+/* ---------- excluir (lógico) ---------- */
+function mntFormExcluir(id){
+  const m=DB.manutencoes.find(x=>x.id===id); if(!m) return;
+  openModal("Excluir registro",`<div class="hint" style="margin-top:0">${esc(mntServico(m))} · ${mntData(m.data)} · ${m.km!==""&&m.km!=null?fmtKm(m.km):"sem KM"}</div>
+    <label for="mx-mot">Motivo da exclusão</label><input id="mx-mot" maxlength="300" placeholder="Ex.: lançado em duplicidade">
+    <div class="hint">O registro sai do cálculo e dos custos, mas continua guardado na planilha para auditoria.</div>
+    <div class="err" id="mx-err" role="alert"></div>
+    <div class="wizard-nav"><button class="btn sec" onclick="closeModal()">Cancelar</button>
+      <button class="btn red" onclick="salvarComBotao(this,()=>mntExcluir('${id}'))">Excluir registro</button></div>`);
+}
+function mntExcluir(id){
+  const m=DB.manutencoes.find(x=>x.id===id), mot=$("#mx-mot").value.trim();
+  if(!mot){ $("#mx-err").textContent="Informe o motivo da exclusão."; return; }
+  if(!mntPodeEditar()){ $("#mx-err").textContent="Seu perfil não pode excluir registros."; return; }
+  Object.assign(m,{excluido:true,excluidoEm:nowISO(),excluidoPor:SESSION.nome,motivoExclusao:mot});
+  const v=veiculo(m.veiculoId);
+  log("Excluiu registro de manutenção",(v?v.interno:"")+" · "+mntServico(m)+" · motivo: "+mot);
+  mntInvalidar(); try{ mntSincronizarAlertas(); }catch(e){}
+  saveSync(["manutencoes","auditoria"]); closeModal(); toast("Registro excluído (continua guardado para auditoria)","ok");
+  go("veiculo-det",m.veiculoId);
+}
+
+/* ---------- leitura de KM lançada pelo gestor ---------- */
+function mntFormLeitura(vid){
+  const v=veiculo(vid), k=kmAtual(vid);
+  openModal("Lançar leitura de KM",`<div class="hint" style="margin-top:0">${esc(v.interno)} · ${esc(v.placa)} · último registro: ${k?fmtKm(k):"sem leitura"}. Normalmente o KM chega sozinho pelas retiradas e entregas dos motoristas.</div>
+    <label for="ml-km">KM do painel</label><input id="ml-km" type="number" inputmode="numeric" min="0" oninput="mntLeituraCheck('${vid}')">
+    <label for="ml-obs">Observação</label><input id="ml-obs" maxlength="300" placeholder="Ex.: conferido na oficina">
+    <div id="ml-reg" class="mnt-box-red" style="display:none"><b>O valor é menor que o último registrado.</b> Isso só deve ser feito para corrigir erro de digitação. A correção fica registrada na auditoria.
+      <label for="ml-mot">Motivo da correção</label><input id="ml-mot" maxlength="300">
+      <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="ml-ok" style="width:auto"> Confirmo a correção para um valor menor</label></div>
+    <div class="mnt-prev" id="ml-prev"></div><div class="err" id="ml-err" role="alert"></div>
+    <div class="wizard-nav"><button class="btn sec" onclick="closeModal()">Cancelar</button>
+      <button class="btn" onclick="salvarComBotao(this,()=>mntSalvarLeitura('${vid}'))">Salvar KM</button></div>`);
+}
+function mntLeituraCheck(vid){
+  const s=$("#ml-km").value.trim(), km=/^\d+$/.test(s)?+s:NaN, k=kmAtual(vid), v=veiculo(vid);
+  $("#ml-reg").style.display=!isNaN(km)&&k&&km<k?"":"none";
+  const muda=[]; if(!isNaN(km)){ const c=mntCalc(vid); c.itens.forEach(i=>{ if(i.proximaKm==null) return; const r=i.proximaKm-km, st=r<=0?"vencida":r<=i.alertaKm?"proxima":"em_dia"; if(st!==i.status&&st!=="em_dia") muda.push(`${i.nome}: ${st==="vencida"?"passa a vencida":"entra no aviso de troca próxima"}`); }); }
+  $("#ml-prev").innerHTML=(!isNaN(km)&&k&&km-k>15000?`Confira o valor: são ${fmtKm(km-k)} a mais que o último registro. `:"")+(muda.length?"Com essa leitura — "+esc(muda.join("; "))+".":"");
+}
+function mntSalvarLeitura(vid){
+  const v=veiculo(vid), s=$("#ml-km").value.trim(), err=$("#ml-err"); err.textContent="";
+  if(!/^\d+$/.test(s)){ err.textContent="Informe o KM (somente números)."; return; }
+  const km=+s, k=kmAtual(vid), obs=$("#ml-obs").value.trim();
+  if(k&&km<k){
+    if(!podeCorrigirKm()){ err.textContent="Só o gestor pode reduzir o KM."; return; }
+    const mot=$("#ml-mot").value.trim();
+    if(!mot){ err.textContent="Informe o motivo da correção."; return; }
+    if(!$("#ml-ok").checked){ err.textContent="Marque a confirmação da correção."; return; }
+    const t=nowISO(); Object.assign(v,{km,kmEm:t,kmCorrigidoEm:t,kmCorrigidoValor:km});
+    log("Corrigiu KM do veículo",v.interno+": "+fmtNum(k)+" → "+fmtNum(km)+" · motivo: "+mot+(obs?" · "+obs:""));
+  } else if(km===k){ err.textContent="O KM informado é igual ao último registro."; return; }
+  else { v.km=km; v.kmEm=nowISO(); log("Lançou leitura de KM",v.interno+": "+fmtNum(k)+" → "+fmtNum(km)+(obs?" · "+obs:"")); }
+  mntInvalidar(); try{ mntSincronizarAlertas(); }catch(e){}
+  saveSync(["veiculos","auditoria"]); closeModal(); toast("KM atualizado para "+fmtKm(km),"ok"); go("veiculo-det",vid);
+}
+
+/* ---------- cadastro e intervalos da viatura ---------- */
+function mntFormCadastro(vid){
+  const v=veiculo(vid), cfg=mntCfg(), iv=v.intervalos||{}, cmd=mntModeloComando(v,cfg);
+  const f=(k,l)=>`<div><label for="mc-${k}">${l}</label><input id="mc-${k}" type="number" min="${k==="alertaKm"?0:1}" step="1" value="${esc(iv[k]??"")}" placeholder="${k==="oleo"?"Padrão: "+fmtNum(mntMoto(v)?cfg.oleoMoto:cfg.oleoCarro):k==="comando"?(cmd?"Padrão "+cmd.modelo+": "+fmtNum(cmd.km):"Sem padrão para o modelo"):"Padrão: "+fmtNum(cfg[k])}"></div>`;
+  openModal("Cadastro e intervalos",`<div class="hint" style="margin-top:0">${esc(v.interno)} · ${esc(v.placa)} · ${esc(v.tipo)}</div>
+    <div class="two"><div><label for="mc-marca">Marca</label><input id="mc-marca" value="${esc(v.marca||"")}"></div><div><label for="mc-modelo">Modelo</label><input id="mc-modelo" value="${esc(v.modelo||"")}"></div></div>
+    <div class="two"><div><label for="mc-ano">Ano</label><input id="mc-ano" type="number" value="${esc(v.ano||"")}"></div><div><label for="mc-motor">Motor / motorização</label><input id="mc-motor" value="${esc(v.motor||"")}" placeholder="Ex.: 1.0 Fire Evo"></div></div>
+    <label for="mc-cmd">Sistema de comando</label><select id="mc-cmd">${[["","Não informado"],["correia","Correia dentada"],["corrente","Corrente de comando"]].map(([k,t])=>`<option value="${k}" ${(v.comando||"")===k?"selected":""}>${t}</option>`).join("")}</select>
+    <div class="hint">O mesmo modelo pode usar correia ou corrente conforme ano e motor. Confirme no manual do fabricante.</div>
+    <div class="section-title" style="font-size:14px;margin:16px 0 4px">Intervalos desta viatura (em branco = padrão)</div>
+    <div class="two">${f("oleo","Óleo do motor (km)")}${f("comando","Correia / corrente (km)")}</div>
+    <div class="two">${f("pneuDianteiro","Pneus dianteiros (km)")}${f("pneuTraseiro","Pneus traseiros (km)")}</div>
+    <div class="two">${f("alertaKm","Avisar quando faltarem (km)")}<div></div></div>
+    <div class="err" id="mc-err" role="alert"></div>
+    <div class="wizard-nav"><button class="btn sec" onclick="closeModal()">Cancelar</button><button class="btn" onclick="salvarComBotao(this,()=>mntSalvarCadastro('${vid}'))">Salvar</button></div>`);
+}
+function mntSalvarCadastro(vid){
+  const v=veiculo(vid), err=$("#mc-err"); err.textContent="";
+  const iv={}; for(const k of ["oleo","comando","pneuDianteiro","pneuTraseiro","alertaKm"]){
+    const s=$("#mc-"+k).value.trim(); if(s==="") continue;
+    if(!/^\d+$/.test(s)||(k!=="alertaKm"&&+s<1)||+s>1000000){ err.textContent="Intervalo inválido: "+$("label[for=mc-"+k+"]").textContent; return; }
+    iv[k]=+s; }
+  const ano=$("#mc-ano").value.trim();
+  if(ano&&(+ano<1950||+ano>new Date().getFullYear()+1)){ err.textContent="Ano inválido."; return; }
+  Object.assign(v,{marca:$("#mc-marca").value.trim(),modelo:$("#mc-modelo").value.trim(),ano,motor:$("#mc-motor").value.trim(),comando:$("#mc-cmd").value,intervalos:iv});
+  log("Alterou cadastro/intervalos da preventiva",v.interno+" · "+JSON.stringify(iv));
+  mntInvalidar(); try{ mntSincronizarAlertas(); }catch(e){}
+  saveSync(["veiculos","auditoria"]); closeModal(); toast("Cadastro salvo. As previsões foram recalculadas.","ok"); go("veiculo-det",vid);
+}
+
+/* ---------- intervalos padrão (aba config) ---------- */
+function mntFormConfig(){
+  const c=mntCfg(), f=(k,l)=>`<div><label for="mg-${k}">${l}</label><input id="mg-${k}" type="number" min="${k==="alertaKm"?0:1}" value="${c[k]}"></div>`;
+  openModal("Intervalos padrão",`<div class="hint" style="margin-top:0">Valem para toda viatura que não tiver intervalo próprio.</div>
+    <div class="two">${f("oleoCarro","Óleo · carros (km)")}${f("oleoMoto","Óleo · motos (km)")}</div>
+    <div class="two">${f("pneuDianteiro","Pneus dianteiros (km)")}${f("pneuTraseiro","Pneus traseiros (km)")}</div>
+    <div class="two">${f("alertaKm","Avisar quando faltarem (km)")}<div></div></div>
+    <div class="section-title" style="font-size:14px;margin:16px 0 8px">Correia / corrente de comando por modelo</div>
+    <div class="mnt-modelos" id="mg-mod"></div>
+    <button class="btn sm sec" onclick="mntCfgLinha()">＋ Adicionar modelo</button>
+    <div class="hint">O modelo é procurado no campo "Modelo" do cadastro do veículo. Fora desta lista, a viatura fica sem previsão até receber um intervalo próprio.</div>
+    <div class="err" id="mg-err" role="alert"></div>
+    <div class="wizard-nav"><button class="btn sec" onclick="closeModal()">Cancelar</button><button class="btn" onclick="salvarComBotao(this,mntSalvarConfig)">Salvar</button></div>`);
+  (c.comandoModelos||[]).forEach(mntCfgLinha);
+}
+function mntCfgLinha(m){ m=m||{}; const d=document.createElement("div"); d.className="lin";
+  d.innerHTML=`<input class="g-mod" placeholder="Modelo" aria-label="Modelo" value="${esc(m.modelo||"")}"><input class="g-mar" placeholder="Marca" aria-label="Marca" value="${esc(m.marca||"")}"><input class="g-km" type="number" min="1" placeholder="km" aria-label="Intervalo em km" value="${m.km??""}"><button type="button" aria-label="Remover modelo">✕</button>`;
+  d.querySelector("button").onclick=()=>d.remove(); $("#mg-mod").appendChild(d); }
+function mntSalvarConfig(){
+  const err=$("#mg-err"); err.textContent=""; const o={id:MNT_CFG_ID};
+  for(const k of ["oleoCarro","oleoMoto","pneuDianteiro","pneuTraseiro","alertaKm"]){ const s=$("#mg-"+k).value.trim();
+    if(!/^\d+$/.test(s)||(k!=="alertaKm"&&+s<1)){ err.textContent="Valor inválido: "+$("label[for=mg-"+k+"]").textContent; return; } o[k]=+s; }
+  const vistos=new Set(); o.comandoModelos=[];
+  for(const l of $$("#mg-mod .lin")){ const mo=l.querySelector(".g-mod").value.trim(), ma=l.querySelector(".g-mar").value.trim(), km=l.querySelector(".g-km").value.trim();
+    if(!mo&&!km) continue; if(!mo||!/^\d+$/.test(km)||+km<1){ err.textContent="Preencha modelo e intervalo em km"+(mo?" para "+mo:"")+"."; return; }
+    const ch=mntTk(mo).join(" "); if(vistos.has(ch)){ err.textContent="O modelo "+mo+" aparece duas vezes."; return; } vistos.add(ch);
+    o.comandoModelos.push({modelo:mo,marca:ma,km:+km}); }
+  o.atualizadoEm=nowISO(); o.atualizadoPor=SESSION.nome;
+  DB.config=DB.config||[]; const i=DB.config.findIndex(x=>x.id===MNT_CFG_ID); if(i>=0) DB.config[i]=o; else DB.config.push(o);
+  log("Alterou intervalos padrão da preventiva",JSON.stringify(o));
+  mntInvalidar(); try{ mntSincronizarAlertas(); }catch(e){}
+  saveSync(["config","auditoria"]); closeModal(); toast("Intervalos salvos. As previsões da frota foram recalculadas.","ok"); go("preventiva");
+}
+
+/* ---------- importação da planilha de custos (abas Preventivas + Lançamentos) ---------- */
+function mntFormImportar(){
+  openModal("Importar planilha",`<div class="hint" style="margin-top:0">Escolha a planilha de custos de manutenção (.xlsx) com as abas <b>Preventivas</b> e <b>Lançamentos</b>.
+    As trocas de óleo e correia são ligadas às viaturas pela placa. Nada é gravado antes da sua confirmação, e importar de novo não duplica.</div>
+    <label for="mi-arq">Arquivo</label><input id="mi-arq" type="file" accept=".xlsx,.xlsm">
+    <div id="mi-res" class="mnt-imp-res"></div>
+    <div class="err" id="mi-err" role="alert"></div>
+    <div class="wizard-nav"><button class="btn sec" onclick="closeModal()">Cancelar</button><button class="btn" id="mi-ok" disabled onclick="salvarComBotao(this,mntConfirmarImportacao)">Importar</button></div>`);
+  $("#mi-arq").onchange=mntLerArquivoImportacao;
+}
+async function mntLerArquivoImportacao(){
+  const f=$("#mi-arq").files[0], err=$("#mi-err"), res=$("#mi-res"); err.textContent=""; res.innerHTML='<div class="hint">Lendo a planilha…</div>'; $("#mi-ok").disabled=true;
+  try{
+    await mntCarregarXLSX();
+    const wb=XLSX.read(await f.arrayBuffer(),{type:"array",cellFormula:true});
+    const plano=mntPlanoImportacao(wb, f.name);
+    MNT.imp=plano;
+    const fl=k=>plano.registros.filter(r=>r.flag===k).length;
+    res.innerHTML=`<div class="rec-lines">
+      <div class="rl"><span>Viaturas na planilha</span><b>${plano.planilha}</b></div>
+      <div class="rl"><span>Encontradas no app (pela placa)</span><b>${plano.casadas}</b></div>
+      <div class="rl"><span>Trocas a importar</span><b>${plano.registros.length} (${plano.registros.filter(r=>r.item==="oleo").length} óleo, ${plano.registros.filter(r=>r.item==="comando").length} correia)</b></div>
+      <div class="rl"><span>Sem data na planilha</span><b>${fl("sem data")}</b></div>
+      <div class="rl"><span>Correia original de fábrica (0 km)</span><b>${fl("fabrica")}</b></div>
+      <div class="rl"><span>KM aproximado — conferir depois</span><b>${fl("km aproximado")}</b></div>
+      <div class="rl"><span>Só no histórico de custos (sem KM)</span><b>${fl("sem km")}</b></div>
+      <div class="rl"><span>Já importadas antes (serão mantidas)</span><b>${plano.registros.filter(r=>DB.manutencoes.some(m=>m.id===r.id)).length}</b></div>
+      <div class="rl"><span>Cadastros completados (marca/modelo/ano vazios)</span><b>${plano.veiculos.filter(x=>Object.keys(x.campos).length).length}</b></div></div>
+      ${plano.semViatura.length?`<div class="mnt-box-red" style="margin-top:0">Placas da planilha que não estão no app (as trocas delas não serão importadas): <b>${plano.semViatura.map(esc).join(", ")}</b>. Cadastre-as em Veículos e importe de novo.</div>`:""}
+      ${plano.avisos.length?`<div class="hint" style="margin-top:8px">${plano.avisos.map(esc).join("<br>")}</div>`:""}`;
+    $("#mi-ok").disabled=!plano.registros.length;
+    $("#mi-ok").textContent=`Importar ${plano.registros.length} trocas`;
+  }catch(e){ console.error(e); res.innerHTML=""; err.textContent=e.message||"Não foi possível ler a planilha."; }
+}
+function mntPlanoImportacao(wb,nomeArq){
+  const S=XLSX.utils, origem="Importado da planilha "+String(nomeArq||"").replace(/\.xlsx?m?$/i,"");
+  const shP=wb.Sheets["Preventivas"], shL=wb.Sheets["Lançamentos"]||wb.Sheets["Lancamentos"];
+  if(!shP) throw new Error('A planilha não tem a aba "Preventivas".');
+  const norm=t=>String(t??"").normalize("NFD").replace(/[\u0300-\u036f]/g,"").toUpperCase().replace(/\s+/g," ").trim();
+  const cel=(sh,r,c)=>sh[S.encode_cell({r,c})];
+  const val=(sh,r,c)=>{ const x=cel(sh,r,c); return x?x.v:null; };
+  const num=v=>typeof v==="number"&&isFinite(v)?v:(v!=null&&/^\s*\d+([.,]\d+)?\s*$/.test(String(v))?+String(v).replace(",","."):null);
+  // ----- Preventivas -----
+  const rgP=S.decode_range(shP["!ref"]);
+  let hr=-1, col={};
+  for(let r=rgP.s.r;r<=Math.min(rgP.e.r,30)&&hr<0;r++){ const nomes=[]; for(let c=rgP.s.c;c<=rgP.e.c;c++) nomes.push(norm(val(shP,r,c)));
+    if(nomes.includes("PLACA")&&nomes.some(n=>n.startsWith("TROCA DE OLEO"))){ hr=r; nomes.forEach((n,i)=>{ if(n&&col[n]===undefined) col[n]=i+rgP.s.c; }); } }
+  if(hr<0) throw new Error('Não encontrei o cabeçalho (PLACA / TROCA DE ÓLEO) na aba "Preventivas".');
+  const C=k=>{ const n=norm(k); const ach=Object.keys(col).find(x=>x===n)||Object.keys(col).find(x=>x.startsWith(n)); return ach!==undefined?col[ach]:-1; };
+  const cP={placa:C("PLACA"),veic:C("VEICULO"),ano:C("ANO"),km:C("KM ATUAL"),oleo:C("TROCA DE OLEO"),ivO:C("INTERVALO OLEO"),corr:C("TROCA CORREIA"),ivC:C("INTERVALO CORREIA")};
+  const pv=[];
+  for(let r=hr+1;r<=rgP.e.r;r++){ const placa=mntPlaca(val(shP,r,cP.placa)); if(!/^[A-Z]{3}\d[A-Z0-9]\d\d$/.test(placa)) continue;
+    pv.push({placa,veic:String(val(shP,r,cP.veic)||"").trim(),ano:num(val(shP,r,cP.ano)),km:num(val(shP,r,cP.km)),oleo:num(val(shP,r,cP.oleo)),ivO:num(val(shP,r,cP.ivO)),corr:num(val(shP,r,cP.corr)),ivC:num(val(shP,r,cP.ivC))}); }
+  const PL=new Map(pv.map(p=>[p.placa,p]));
+  const modelo=v=>{ const t=norm(v); for(const [k,ma,mo,ti] of [["PALIO","Fiat","Palio","carro"],["MOBI","Fiat","Mobi","carro"],["UNO","Fiat","Uno","carro"],["GOL","Volkswagen","Gol","carro"],["ONIX","Chevrolet","Onix","carro"],["KWID","Renault","Kwid","carro"],["L200","Mitsubishi","L200","carro"],["CG FAN","Honda","CG Fan","moto"],["CG 160 START","Honda","CG 160 Start","moto"],["CG 160","Honda","CG 160","moto"],["JTZ","","JTZ","moto"],["MOTO","","","moto"]]) if(t.includes(k)) return {marca:ma,modelo:mo,tipo:ti}; return {marca:"",modelo:"",tipo:""}; };
+  // ----- Lançamentos (data, valor; a coluna KM pode ser fórmula = odômetro atual) -----
+  const ev=[], avisos=[];
+  if(shL){
+    const rgL=S.decode_range(shL["!ref"]); const cl={};
+    for(let c=rgL.s.c;c<=rgL.e.c;c++){ const n=norm(val(shL,rgL.s.r,c)); if(n&&cl[n]===undefined) cl[n]=c; }
+    const L=k=>cl[norm(k)]??-1;
+    const cL={data:L("DATA"),placa:L("PLACA"),km:L("KM ATUAL"),tipo:L("TIPO"),serv:L("SERVICO EXECUTADO"),of:L("OFICINA"),tot:L("VALOR TOTAL")};
+    for(let r=rgL.s.r+1;r<=rgL.e.r;r++){
+      const placa=mntPlaca(val(shL,r,cL.placa)); if(!placa) continue;
+      const tipo=norm(val(shL,r,cL.tipo)), serv=String(val(shL,r,cL.serv)||"").trim(), s=serv.toLowerCase();
+      const trocaOleo=/troca d[oea]s? [oó]leo|[oó]leo e filtro|troca do oleo|troca de oleo/.test(s);
+      let oleo=tipo==="TROCA DE OLEO"||trocaOleo;
+      if(/interrup|bomba de [oó]leo|[oó]leo de freio/.test(s)&&!trocaOleo) oleo=tipo==="TROCA DE OLEO";
+      const corr=/correia dentada|correia de distribui/i.test(serv);
+      if(!oleo&&!corr){ if(/\b[oó]leo\b/.test(s)&&!/interrup|freio|bomba/.test(s)) avisos.push(`Lançamentos linha ${r+1}: "${serv}" menciona óleo sem deixar claro se foi troca — não importado.`); continue; }
+      const dv=val(shL,r,cL.data); let data="";
+      if(typeof dv==="number"){ const d=XLSX.SSF.parse_date_code(dv); if(d) data=`${d.y}-${String(d.m).padStart(2,"0")}-${String(d.d).padStart(2,"0")}`; }
+      else if(dv instanceof Date) data=localD(dv);
+      const ck=cel(shL,r,cL.km);
+      const base={lin:r+1,data,placa,kmPl:num(ck?ck.v:null),formula:!!(ck&&ck.f),serv:serv||(oleo?"Troca de óleo":""),oficina:String(val(shL,r,cL.of)||"").trim(),valor:num(val(shL,r,cL.tot))};
+      if(oleo) ev.push(Object.assign({},base,{item:"oleo"}));
+      if(corr) ev.push(Object.assign({},base,{item:"comando",valor:oleo?null:base.valor}));
+    }
+  } else avisos.push('A planilha não tem a aba "Lançamentos": as trocas entram sem data e sem valor.');
+  // ----- regras (mesmas da conferência entregue) -----
+  const regs=[], fmt=n=>Number(n).toLocaleString("pt-BR");
+  const add=(placa,item,data,km,valor,oficina,desc,obs,flag)=>regs.push({placa,item,data:data||"",km,valor:valor==null?0:Math.round(valor*100)/100,oficina:oficina||"",descricao:(desc||"").slice(0,300),obs,flag:flag||""});
+  pv.forEach(p=>{
+    const moto=modelo(p.veic).tipo==="moto";
+    [["oleo",p.oleo],["comando",moto?null:p.corr]].forEach(([item,P])=>{
+      const es=ev.filter(e=>e.placa===p.placa&&e.item===item).sort((a,b)=>a.data.localeCompare(b.data));
+      const tol=item==="oleo"?(p.ivO===1500?150:1000):5000;
+      let usado=null;
+      if(P!=null&&P!==0){
+        const cand=[];
+        es.forEach(e=>{ const k=e.kmPl; if(k==null) return;
+          if(Math.abs(k-P)<=tol) cand.push([Math.abs(k-P),e,k===P?"igual":"proximo"]);
+          else if(p.km&&k>p.km&&String(Math.trunc(k)).startsWith(String(Math.trunc(P)))) cand.push([0.5,e,"digito"]); });
+        if(cand.length){ cand.sort((a,b)=>a[0]-b[0]); const [,e,t]=cand[0]; usado=e;
+          let obs=`${origem} (Preventivas + Lançamentos linha ${e.lin}).`;
+          if(t==="proximo") obs+=` Lançamentos registra ${fmt(e.kmPl)} km; mantido o km da aba Preventivas.`;
+          if(t==="digito") obs+=` Lançamentos registra ${fmt(e.kmPl)} km (dígito a mais); usado o km da aba Preventivas.`;
+          add(p.placa,item,e.data,Math.trunc(P),e.valor,e.oficina,e.serv,obs,""); }
+        else add(p.placa,item,"",Math.trunc(P),null,"","",`${origem} (aba Preventivas). A planilha não informa a data desta troca.`,"sem data");
+      } else if(P===0&&item==="comando") add(p.placa,item,"",0,null,"","Correia/corrente original de fábrica",`${origem}: a aba Preventivas indica 0 km (sem troca desde o veículo novo).`,"fabrica");
+      es.filter(e=>e!==usado).forEach(e=>{
+        const k=e.kmPl, ultimo=e===es[es.length-1], plaus=k!=null&&(!p.km||k<=p.km), nota=`${origem} (Lançamentos linha ${e.lin}).`;
+        if(e.formula){
+          if(ultimo&&k!=null&&(P==null||k>P)) add(p.placa,item,e.data,Math.trunc(k),e.valor,e.oficina,e.serv,nota+" KM APROXIMADO: nesta linha a planilha mostra o odômetro atual, não o do dia do serviço. Confirme.","km aproximado");
+          else add(p.placa,item,e.data,null,e.valor,e.oficina,e.serv,nota+" KM não importado: a planilha mostra o odômetro atual nesta linha, não o do dia do serviço.","sem km");
+        } else if(plaus) add(p.placa,item,e.data,Math.trunc(k),e.valor,e.oficina,e.serv,nota,"");
+        else add(p.placa,item,e.data,null,e.valor,e.oficina,e.serv,nota+" KM não importado: "+(k==null?"sem KM na planilha":`KM ${fmt(k)} maior que o odômetro atual (${fmt(p.km)}), provável erro de digitação`)+".","sem km");
+      });
+    });
+  });
+  regs.forEach(r=>{ if(/pneu|relação|freio|velocímetro/i.test(r.descricao)) r.obs+=" O valor refere-se ao serviço completo descrito."; });
+  // ----- ligar às viaturas do app pela placa (aceita placa curta no app, ex.: "FKD") -----
+  const apps=DB.veiculos.filter(v=>!ehGerador(v)), mapa=new Map();
+  pv.forEach(p=>{ const ex=apps.find(v=>mntPlaca(v.placa)===p.placa); if(ex) mapa.set(p.placa,ex); });
+  apps.forEach(v=>{ const pp=mntPlaca(v.placa); if(pp.length<3||pp.length>=7||[...mapa.values()].includes(v)) return;
+    const cs=pv.filter(p=>p.placa.startsWith(pp)&&!mapa.has(p.placa)); if(cs.length===1){ mapa.set(cs[0].placa,v); avisos.push(`Placa curta no app: ${v.interno} "${v.placa}" ligada a ${cs[0].placa}.`); } });
+  const semViatura=pv.filter(p=>!mapa.has(p.placa)).map(p=>p.placa);
+  const registros=regs.filter(r=>mapa.has(r.placa)).map(r=>{ const v=mapa.get(r.placa);
+    const id="imp-"+mntPlaca(nomeArq).slice(0,24)+"-"+r.placa+"-"+r.item+"-"+(r.km==null?"x":r.km)+"-"+(r.data||"sd");
+    return Object.assign(r,{id,veiculoId:v.id,interno:v.interno}); });
+  const veiculos=pv.filter(p=>mapa.has(p.placa)).map(p=>{ const v=mapa.get(p.placa), m=modelo(p.veic), campos={};
+    if(!v.marca&&m.marca) campos.marca=m.marca; if(!v.modelo&&m.modelo) campos.modelo=m.modelo; if(!v.ano&&p.ano) campos.ano=String(p.ano);
+    if(m.tipo==="carro"&&["Uno","L200"].includes(m.modelo)&&p.ivC&&!(+(v.intervalos||{}).comando>0)) campos.intervalos=Object.assign({},v.intervalos||{},{comando:p.ivC});
+    return {v,campos}; });
+  registros.forEach(r=>{ const k=kmAtual(r.veiculoId); if(r.km!=null&&k>0&&r.km>k) avisos.push(`${r.interno} (${r.placa}): troca de ${r.item==="oleo"?"óleo":"correia"} com ${fmtKm(r.km)} na planilha, acima do KM registrado pelos motoristas (${fmtKm(k)}). Confira depois na página do veículo.`); });
+  return {origem,planilha:pv.length,casadas:pv.length-semViatura.length,semViatura,registros,veiculos,avisos};
+}
+function mntConfirmarImportacao(){
+  const p=MNT.imp; if(!p||!p.registros.length) return;
+  if(!mntPodeEditar()){ $("#mi-err").textContent="Seu perfil não pode importar registros."; return; }
+  let novos=0;
+  const tipoDe=(r,v)=>r.item==="oleo"?"Óleo":mntNomeItem("comando",v);
+  p.registros.forEach(r=>{
+    if(DB.manutencoes.some(m=>m.id===r.id)) return;
+    const v=veiculo(r.veiculoId);
+    DB.manutencoes.push({id:r.id,veiculoId:r.veiculoId,placa:v.placa,veiculoInterno:v.interno,preventiva:r.item,tipo:tipoDe(r,v),posicoes:"",
+      data:r.data?dataInputISO(r.data):"",km:r.km==null?"":r.km,descricao:r.descricao,oficina:r.oficina,valor:r.valor,obs:r.obs,nf:"",foto:null,
+      origem:p.origem,kmNaoConta:true,importadoEm:nowISO(),importadoPor:SESSION.nome,registradoPor:SESSION.nome,registradoPorId:SESSION.id,registradoEm:nowISO()});
+    novos++;
+  });
+  let comp=0; p.veiculos.forEach(x=>{ if(Object.keys(x.campos).length){ Object.assign(x.v,x.campos); comp++; } });
+  log("Importou trocas da planilha",p.origem+" · "+novos+" troca(s) · "+comp+" cadastro(s) completado(s)");
+  mntInvalidar(); try{ mntSincronizarAlertas(); }catch(e){}
+  saveSync(["manutencoes","veiculos","auditoria"]); closeModal(); MNT.imp=null;
+  toast(`${novos} troca(s) importada(s)${p.registros.length-novos?`, ${p.registros.length-novos} já existiam`:""}.`,"ok"); go("preventiva");
+}
 </script>
 
 <!-- ===== PWA: banner de instalação ===== -->

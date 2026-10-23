@@ -27,6 +27,24 @@
  *     consegue usar funções administrativas, mesmo alterando o app).
  *   - Baixa administrativa de veículo não entregue (aba "baixas"),
  *     com histórico que NÃO pode ser alterado nem apagado.
+ *
+ *  AJUSTE 6.1 (out/2026) — basta colar e publicar "Nova versão":
+ *   - Motorista consegue devolver viatura que o gestor retirou no nome
+ *     dele, mesmo quando a retirada ficou com o id de um cadastro
+ *     duplicado (confere pelo nome).
+ *   - Correção de KM pelo gestor (dígito a mais) não é desfeita por
+ *     aparelhos desatualizados.
+ *   - Se um item extra (ocorrência/auditoria) falhar, a entrega NÃO é
+ *     recusada — ela já foi gravada.
+ *
+ *  AJUSTE 6.2 (out/2026) — MANUTENÇÃO PREVENTIVA — basta colar e publicar
+ *  "Nova versão" (as abas novas são criadas sozinhas, nada é apagado):
+ *   - Abas "config" (intervalos padrão da preventiva) e "alertas"
+ *     (histórico de alertas de troca de óleo, correia/corrente e pneus).
+ *   - As trocas ficam na aba "manutencoes", que já existia.
+ *   - Registro de manutenção excluído (exclusão lógica) ou importado de
+ *     planilha não conta como leitura de KM: assim nunca bloqueia a
+ *     retirada de um motorista com "KM inválido".
  *******************************************************************/
 
 // ====== CONFIG ======
@@ -41,7 +59,7 @@ var NIVEIS_BAIXA = ["Administrador","Gestor"];
 // Abas (tabelas) do banco
 var ABAS = ["usuarios","motoristas","veiculos","destinos","retiradas",
             "devolucoes","abastecimentos","manutencoes","ocorrencias","calibragens",
-            "baixas","auditoria","meta"];
+            "baixas","auditoria","config","alertas","meta"];
 
 /* Colunas de cada aba (exceto "meta"):
    A id | B json (registro completo) | C atualizadoEm (ms) |
@@ -245,18 +263,24 @@ function handle_(e){
     else if(acao==="push"){                 // grava/atualiza um registro
       // body: {aba, registro:{...}}
       exigirSessao_(sess);
-      upsert_(body.aba, body.registro, {sess:sess});
+      var salvo = upsert_(body.aba, body.registro, {sess:sess});
+      liberarPorDevolucao_(body.aba, salvo);
       out = {ok:true};
+      if(difereDoEnviado_(salvo, body.registro)) out.registro = salvo;
     }
     else if(acao==="pushMuitos"){           // grava vários de uma vez
       // grava todos os que puder; se algum falhar, avisa (o app reenvia)
       exigirSessao_(sess);
-      var falhas = [];
+      var falhas = [], diferentes = [];
       (body.itens||[]).forEach(function(it){
-        try{ upsert_(it.aba, it.registro, {sess:sess}); }
+        try{
+          var salvo = upsert_(it.aba, it.registro, {sess:sess});
+          liberarPorDevolucao_(it.aba, salvo);
+          if(difereDoEnviado_(salvo, it.registro)) diferentes.push({aba:it.aba, registro:salvo});
+        }
         catch(e){ falhas.push((it.registro&&it.registro.id)+": "+e); }
       });
-      out = falhas.length ? {ok:false, erro:"falhou: "+falhas.join(" | ")} : {ok:true};
+      out = falhas.length ? {ok:false, erro:"falhou: "+falhas.join(" | "), diferentes:diferentes} : {ok:true, diferentes:diferentes};
     }
     else if(acao==="apagar"){               // apaga um registro por id
       // body: {aba, id}
@@ -350,7 +374,7 @@ function indicesDe_(aba, r){
   var data = r && r.data ? (new Date(r.data).getTime()||"") : "";
   return [
     r && r.veiculoId ? String(r.veiculoId) : "",
-    campo ? (Number(r[campo])||0) : "",
+    campo ? ((r && (r.excluido || r.kmNaoConta)) ? 0 : (Number(r[campo])||0)) : "",
     data,
     aba==="retiradas" ? (r.devolvida ? 0 : 1) : "",
     r ? String(r.motoristaId || r.responsavelId || "") : ""
@@ -415,6 +439,15 @@ function upsert_(aba, reg, opts){
     reg = autorizar_(opts.sess, aba, reg, antigo);
     if(reg===null) return antigo;              // nada a alterar (ex.: histórico já gravado)
   }
+  // NOMES DUPLICADOS: um motorista NOVO com nome igual a um já cadastrado é
+  // ignorado (era assim que aparelhos com a lista antiga recriavam cada técnico).
+  if(aba==="motoristas" && !antigo){
+    var chave = chaveNome_(reg.nome);
+    if(chave){
+      var lista = lerTabela_("motoristas");
+      for(var k=0;k<lista.length;k++){ if(chaveNome_(lista[k].nome)===chave) return lista[k]; }
+    }
+  }
   if(antigo){
     if(IMUTAVEIS.indexOf(aba)>=0) return antigo;   // histórico nunca é sobrescrito
     reg = protegerRegistro_(aba, antigo, reg);
@@ -448,7 +481,7 @@ function autorizar_(sess, aba, reg, antigo){
   if(sess.t!=="motorista") throw "SEM_PERMISSAO";
   var meu = function(o){
     return !!o && (String(o.motoristaId||"")===String(sess.id) || String(o.registradoPorId||"")===String(sess.id) ||
-                   String(o.responsavelId||"")===String(sess.id));
+                   String(o.responsavelId||"")===String(sess.id) || mesmoMotorista_(o.motoristaId, o.motoristaNome, sess));
   };
   switch(aba){
     case "auditoria":
@@ -498,8 +531,24 @@ function protegerRegistro_(aba, antigo, novo){
   }
   if(aba==="veiculos"){
     var kmA = Number(antigo.km)||0, kmN = Number(r.km)||0;
-    var correcaoNova = r.kmCorrigidoEm && r.kmCorrigidoEm !== antigo.kmCorrigidoEm;
-    if(kmN < kmA && !correcaoNova){ r.km = kmA; r.kmEm = antigo.kmEm || r.kmEm; }
+    var tA = antigo.kmCorrigidoEm ? (new Date(antigo.kmCorrigidoEm).getTime()||0) : 0;
+    var tN = r.kmCorrigidoEm ? (new Date(r.kmCorrigidoEm).getTime()||0) : 0;
+    var correcaoNova = tN > tA;                       // só uma correção MAIS NOVA pode baixar o KM
+    if(!correcaoNova){
+      if(tA){ r.kmCorrigidoEm = antigo.kmCorrigidoEm; if(antigo.kmCorrigidoValor!==undefined) r.kmCorrigidoValor = antigo.kmCorrigidoValor; }
+      if(kmN < kmA){ r.km = kmA; r.kmEm = antigo.kmEm || r.kmEm; }
+      else if(tA && tN < tA && kmN > kmA){
+        // aparelho que ainda não recebeu a correção: não deixa o KM errado voltar
+        var real = kmAtualServidor_(antigo.id, antigo);
+        if(kmN > real){ r.km = real; r.kmEm = antigo.kmEm || r.kmEm; }
+      }
+    }
+  }
+  var campoKm = CAMPO_KM[aba];
+  if(campoKm && (antigo.correcoesKm||[]).length > (r.correcoesKm||[]).length){
+    // KM corrigido pelo gestor: aparelho com a cópia antiga não regrava o valor errado
+    [campoKm,"kmInicial","kmPercorrido"].forEach(function(k){ if(antigo[k]!==undefined) r[k] = antigo[k]; });
+    r.correcoesKm = antigo.correcoesKm;
   }
   if(aba==="usuarios" && !r.senha && antigo.senha){ r.senha = antigo.senha; }
   return r;
@@ -594,12 +643,71 @@ function acharPorId_(aba, id){
   var linha = idIndex_(aba)[String(id)];
   return linha ? lerLinha_(aba, linha) : null;
 }
+function chaveNome_(s){ return String(s||"").normalize("NFD").replace(/[\u0300-\u036f]/g,"").replace(/\s+/g," ").trim().toLowerCase(); }
 function nomeMotorista_(id){ var m = acharPorId_("motoristas", id); return m ? m.nome : ""; }
+/* O registro é do motorista logado, mesmo com id diferente? Confere pelo NOME.
+   Retiradas feitas pelo gestor num aparelho com a lista antiga (nomes
+   duplicados) ficaram com o id de um cadastro que já foi unificado. */
+function mesmoMotorista_(id, nomeGuardado, sess){
+  if(!sess || sess.t!=="motorista" || !sess.n) return false;
+  var m = id ? acharPorId_("motoristas", id) : null;
+  var nome = m ? m.nome : (nomeGuardado||"");
+  return !!nome && chaveNome_(nome)===chaveNome_(sess.n);
+}
+// O servidor gravou algo diferente do que o aparelho mandou (ignorou ou protegeu)? O aparelho precisa adotar a versão do servidor.
+function difereDoEnviado_(salvo, enviado){
+  if(!salvo || !enviado) return false;
+  try{ return JSON.stringify(salvo)!==JSON.stringify(limpaBase64_(enviado)); }catch(e){ return true; }
+}
+/* Confere cada linha "aberta" no JSON real: índice velho (coluna G) ou
+   linha duplicada do mesmo id não bloqueiam mais a viatura — e são corrigidos. */
 function retiradasAbertasIdx_(vid){
   vid = String(vid);
-  return lerIndices_("retiradas").filter(function(x){ return x.vid===vid && x.aberta; })
-    .sort(function(a,b){ return (b.data||0)-(a.data||0); });
+  var idx = idIndex_("retiradas"), sh = aba_("retiradas");
+  return lerIndices_("retiradas").filter(function(x){
+    if(x.vid!==vid || !x.aberta) return false;
+    var r = lerLinha_("retiradas", x.row);
+    var real = !!r && !r.devolvida && !r.baixaId && String(r.veiculoId)===vid && idx[x.id]===x.row;
+    if(!real){ sh.getRange(x.row,7).setValue(0); x.aberta = false; }
+    return real;
+  }).sort(function(a,b){ return (b.data||0)-(a.data||0); });
 }
+
+/* Rodar no editor: lista divergências da aba retiradas. corrigir=true conserta. */
+function diagnosticoRetiradas(corrigir){
+  var sh = aba_("retiradas"), last = sh.getLastRow(), out = [];
+  if(last<=1){ Logger.log("aba vazia"); return; }
+  var vals = sh.getRange(2,1,last-1,NCOL).getValues();
+  var devs = {}; lerTabela_("devolucoes").forEach(function(d){ if(d.retiradaId) devs[d.retiradaId] = d; });
+  var vista = {}, apagar = [];
+  vals.forEach(function(l,i){
+    var row = i+2, id = String(l[0]); if(!id) return;
+    var r = null; try{ r = JSON.parse(l[1]); }catch(e){}
+    if(!r){ out.push("Linha "+row+" ("+id+"): JSON ilegível"); return; }
+    var abertaIdx = String(l[6])==="1", abertaJson = !r.devolvida;
+    var tag = (r.veiculoInterno||r.veiculoId)+" · "+(r.motoristaNome||r.motoristaId)+" · "+r.data;
+    if(vista[id]){
+      var o = vista[id];
+      out.push("DUPLICADA linha "+row+" (original "+o.row+"): "+tag);
+      if(corrigir && r.devolvida && !o.devolvida){ sh.getRange(o.row,2,1,NCOL-1).setValues([l.slice(1)]); sh.getRange(o.row,7).setValue(0); }
+      apagar.push(row); return;
+    }
+    vista[id] = {row:row, devolvida:!!r.devolvida};
+    if(abertaIdx!==abertaJson){
+      out.push("ÍNDICE ERRADO linha "+row+": coluna G="+l[6]+" mas JSON devolvida="+!!r.devolvida+" · "+tag);
+      if(corrigir) sh.getRange(row,7).setValue(abertaJson?1:0);
+    }
+    if(abertaJson && devs[r.id]) out.push("ABERTA COM ENTREGA registrada ("+devs[r.id].id+") · "+tag+"  → rode corrigirStatusFrotaAuto");
+    else if(abertaJson) out.push("ABERTA · "+tag);
+  });
+  if(corrigir && apagar.length){
+    sh.getParent().getSheetByName("retiradas").copyTo(sh.getParent()).setName("retiradas_backup_"+Date.now());
+    apagar.sort(function(a,b){ return b-a; }).forEach(function(rw){ sh.deleteRow(rw); });
+  }
+  if(corrigir) limparCache_("retiradas");
+  Logger.log(out.length ? out.join("\n") : "Nada encontrado");
+}
+function diagnosticoRetiradasCorrigir(){ diagnosticoRetiradas(true); }
 
 function retirar_(body, sess){
   exigirSessao_(sess);
@@ -615,7 +723,8 @@ function retirar_(body, sess){
   if(abertas.length){
     var aberta = lerLinha_("retiradas", abertas[0].row) || {};
     return {ok:false, erro:"VEICULO_EM_USO", conflito:{retiradaId:aberta.id, motoristaId:aberta.motoristaId,
-      motoristaNome: aberta.motoristaNome || nomeMotorista_(aberta.motoristaId), data:aberta.data, kmInicial:aberta.kmInicial}};
+      motoristaNome: aberta.motoristaNome || nomeMotorista_(aberta.motoristaId), data:aberta.data, kmInicial:aberta.kmInicial},
+      retirada: aberta, veiculo: veiculo};
   }
   var kmAt = kmAtualServidor_(reg.veiculoId, veiculo);
   if((Number(reg.kmInicial)||0) < kmAt) return {ok:false, erro:"KM_INVALIDO", kmAtual:kmAt};
@@ -644,14 +753,23 @@ function devolver_(body, sess){
     upsert_("retiradas", r);
   }
   if(!r) return {ok:false, erro:"RETIRADA_NAO_ENCONTRADA"};
-  if(sess.t==="motorista" && String(r.motoristaId)!==String(sess.id) && String(r.registradoPorId||"")!==String(sess.id))
-    return {ok:false, erro:"SEM_PERMISSAO: esta viatura está no nome de outro motorista"};
+  if(sess.t==="motorista" && String(r.motoristaId)!==String(sess.id) && String(r.registradoPorId||"")!==String(sess.id)){
+    if(!mesmoMotorista_(r.motoristaId, r.motoristaNome, sess))
+      return {ok:false, erro:"SEM_PERMISSAO: esta viatura está no nome de outro motorista — peça ao gestor para usar \"Alterar motorista\""};
+    if(!acharPorId_("motoristas", r.motoristaId)){
+      // id de cadastro que não existe mais: passa a retirada para o cadastro atual do motorista
+      r.motoristaIdAnterior = r.motoristaId; r.motoristaId = sess.id; r.motoristaNome = sess.n;
+      dev.motoristaId = sess.id; dev.motoristaNome = sess.n;
+    }
+  }
   if(r.devolvida){
     if(r.devolucaoId===dev.id) return {ok:true, jaRegistrada:true, veiculo:acharPorId_("veiculos", r.veiculoId)};
     if(r.baixaId) return {ok:false, erro:"BAIXA_ADMINISTRATIVA", baixaId:r.baixaId};
     return {ok:false, erro:"JA_DEVOLVIDA", devolucaoId:r.devolucaoId};
   }
   if((Number(dev.kmFinal)||0) < (Number(r.kmInicial)||0)) return {ok:false, erro:"KM_INVALIDO", kmAtual:Number(r.kmInicial)||0};
+  dev.kmInicial = Number(r.kmInicial)||0;                       // usa o KM da retirada já corrigido pelo gestor
+  dev.kmPercorrido = (Number(dev.kmFinal)||0) - dev.kmInicial;
 
   upsert_("devolucoes", dev);
   r.devolvida = true; r.devolucaoId = dev.id; r.devolvidaEm = dev.data;
@@ -668,13 +786,38 @@ function devolver_(body, sess){
     veiculo.ultimoMotoristaId = r.motoristaId;
     upsert_("veiculos", veiculo);
   }
-  gravarExtras_(body.extras, sess);
-  return {ok:true, veiculo: veiculo ? acharPorId_("veiculos", veiculo.id) : null};
+  var avisos = gravarExtras_(body.extras, sess);
+  return {ok:true, veiculo: veiculo ? acharPorId_("veiculos", veiculo.id) : null,
+    retirada: acharPorId_("retiradas", r.id), devolucao: dev, avisos: avisos};
 }
+/* Devolução que chegou pela fila offline (push/pushMuitos): fecha a retirada e libera a viatura na hora. */
+function liberarPorDevolucao_(aba, dev){
+  if(aba!=="devolucoes" || !dev || !dev.retiradaId) return;
+  var r = acharPorId_("retiradas", dev.retiradaId);
+  if(r && !r.devolvida){
+    r.devolvida = true; r.devolucaoId = r.devolucaoId || dev.id; r.devolvidaEm = r.devolvidaEm || dev.data;
+    upsert_("retiradas", r);
+  }
+  var vid = (r && r.veiculoId) || dev.veiculoId;
+  var v = vid ? acharPorId_("veiculos", vid) : null;
+  if(!v || retiradasAbertasIdx_(v.id).length) return;
+  if(v.status==="Em uso" || !v.status){
+    v.status = "Disponível"; v.motoristaAtualId = ""; v.retiradaAtualId = "";
+    upsert_("veiculos", v);
+  }
+}
+
+/* Grava ocorrência/auditoria que acompanham a retirada/entrega. Se algum item
+   falhar, NÃO desfaz nem recusa a operação principal (que já foi gravada). */
 function gravarExtras_(extras, sess){
+  var avisos = [];
   (extras||[]).forEach(function(it){
-    if(it && it.aba && it.registro && it.aba!=="retiradas" && it.aba!=="devolucoes") upsert_(it.aba, it.registro, {sess:sess});
+    if(it && it.aba && it.registro && it.aba!=="retiradas" && it.aba!=="devolucoes"){
+      try{ upsert_(it.aba, it.registro, {sess:sess}); }
+      catch(e){ avisos.push(it.aba+": "+e); }
+    }
   });
+  return avisos;
 }
 
 // ====== BAIXA ADMINISTRATIVA — VEÍCULO NÃO ENTREGUE ======
@@ -773,7 +916,7 @@ function salvarFoto_(nome, dataUrl){
 }
 
 /*******************************************************************
- *  CORREÇÃO AUTOMÁTICA DO STATUS DA FROTA (a cada 3 horas)
+ *  CORREÇÃO AUTOMÁTICA DO STATUS DA FROTA (a cada 30 minutos)
  *  Faz exatamente o que o botão "Corrigir status da frota" faz no app,
  *  mas sozinho, direto na planilha — mesmo com ninguém usando o app.
  *
@@ -783,9 +926,9 @@ function salvarFoto_(nome, dataUrl){
  *******************************************************************/
 function instalarCorrecaoAutomatica(){
   removerCorrecaoAutomatica();                 // evita gatilho duplicado
-  ScriptApp.newTrigger("corrigirStatusFrotaAuto").timeBased().everyHours(3).create();
+  ScriptApp.newTrigger("corrigirStatusFrotaAuto").timeBased().everyMinutes(30).create();
   var r = corrigirStatusFrotaAuto();           // já roda uma vez agora
-  return "Correção automática ativada (a cada 3 horas). Primeira execução: "+r;
+  return "Correção automática ativada (a cada 30 minutos). Primeira execução: "+r;
 }
 function removerCorrecaoAutomatica(){
   ScriptApp.getProjectTriggers().forEach(function(t){

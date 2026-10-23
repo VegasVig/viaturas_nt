@@ -2,7 +2,7 @@
 // Estratégia "rede primeiro": com internet, sempre pega a versão mais nova
 // do GitHub; sem internet, usa a cópia salva. Assim, toda alteração que você
 // publicar chega sozinha no app instalado.
-const CACHE = 'vegas-frota-niteroi-v6';  // v6: troca de versão força os aparelhos a pegarem o app novo
+const CACHE = 'vegas-frota-niteroi-v10';  // v10: Niterói igualado ao app de Volta Redonda
 const ARQUIVOS = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png',
   './logo-vegas.png', './login-bg.jpg', './login-bg-m.jpg'];
 
