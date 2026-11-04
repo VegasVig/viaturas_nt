@@ -3861,7 +3861,7 @@ let _relData=null,_relTipo=null;
 let _relExtra=null;
 function gerarRelatorio(tipo){
   const f=relFiltro(); _relTipo=tipo; _relExtra=null;
-  let head=[],rows=[],title="";
+  let head=[],rows=[],title="",foot=null;
   if(tipo==="utilizacao"){
     title="Relatório de Utilização";head=["Data","Veículo","Motorista","Destino","KM ini","KM fim","Percorrido","Status"];
     DB.retiradas.filter(r=>f.test(r.data,r.veiculoId,r.motoristaId)).forEach(r=>{
@@ -3874,6 +3874,9 @@ function gerarRelatorio(tipo){
       const v=veiculo(a.veiculoId),m=motorista(a.motoristaId);
       const alvo=ehGer?((a.gerador||"")+(a.local?" ("+a.local+")":"")):(v?.interno||"");
       rows.push([dtBR(a.data),ehGer?"Gerador":"Veículo",alvo,m?.nome||"",a.posto,a.combustivel||"",a.litros,unidadeAbast(a),a.valorLitro,a.total]);});
+    const qt={}; let tt=0;
+    rows.forEach(r=>{ qt[r[7]]=(qt[r[7]]||0)+(+r[6]||0); tt+=(+r[9]||0); });
+    foot=["TOTAL","",rows.length+" abast.","","","",Object.keys(qt).map(u=>fmtQtd(qt[u])).join(" + "),Object.keys(qt).join(" + "),"",fmtMoney(tt)];
   } else if(tipo==="gastos"){
     title="Relatório de Gastos";head=["Veículo","Combustível","Manutenção","Total","KM","Custo/km"];
     DB.veiculos.filter(v=>!f.vid||v.id===f.vid).forEach(v=>{const s=veiculoStats(v.id);
@@ -3901,7 +3904,7 @@ function gerarRelatorio(tipo){
       const v=veiculo(c.veiculoId);
       rows.push([dBR(c.data),hBR(c.data),c.semana||semanaISO(c.data),(v?.interno||c.veiculoInterno||"")+" · "+(v?.placa||c.placa||""),c.responsavelNome||"",c.km||"",c.extra?"Sim":"",c.registradoPor||"",c.obs||""]);});
   }
-  _relData={title,head,rows};
+  _relData={title,head,rows,foot};
   const out=$("#rp-out");
   out.innerHTML=`<div class="section-title">${esc(title)} <span class="line"></span></div>
     ${_relExtra||""}
@@ -3910,12 +3913,12 @@ function gerarRelatorio(tipo){
       <button class="btn sm blue" onclick="exportCSV()">⬇ CSV</button>
       <button class="btn sm" onclick="exportRelPDF()">📄 PDF</button></div>
     <div class="table-wrap"><table><thead><tr>${head.map(h=>`<th>${esc(h)}</th>`).join("")}</tr></thead>
-    <tbody>${rows.length?rows.map(r=>`<tr>${r.map(c=>`<td>${esc(c)}</td>`).join("")}</tr>`).join(""):`<tr><td colspan="${head.length}" style="text-align:center;color:var(--muted2)">Sem dados no período</td></tr>`}</tbody></table></div>`;
+    <tbody>${rows.length?rows.map(r=>`<tr>${r.map(c=>`<td>${esc(c)}</td>`).join("")}</tr>`).join(""):`<tr><td colspan="${head.length}" style="text-align:center;color:var(--muted2)">Sem dados no período</td></tr>`}</tbody>${foot&&rows.length?`<tfoot><tr>${foot.map(c=>`<td style="font-weight:700">${esc(c)}</td>`).join("")}</tr></tfoot>`:""}</table></div>`;
 }
 function exportCSV(){
   if(!_relData)return;
   const{title,head,rows}=_relData;
-  let csv=head.join(";")+"\n"+rows.map(r=>r.map(c=>`"${String(c).replace(/"/g,'""')}"`).join(";")).join("\n");
+  let csv=head.join(";")+"\n"+(_relData.foot&&rows.length?rows.concat([_relData.foot]):rows).map(r=>r.map(c=>`"${String(c).replace(/"/g,'""')}"`).join(";")).join("\n");
   const blob=new Blob(["\ufeff"+csv],{type:"text/csv;charset=utf-8"});
   const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=title.replace(/\s/g,"_")+".csv";a.click();
   toast("CSV exportado");
@@ -3926,7 +3929,7 @@ function exportRelPDF(){
   doc.setFontSize(16);doc.setTextColor(40);doc.text("VEGAS FROTA",14,18);
   doc.setFontSize(11);doc.setTextColor(90);doc.text(_relData.title,14,26);
   doc.setFontSize(8);doc.text("Gerado em "+dtBR(nowISO())+" por "+(SESSION?SESSION.nome:"—")+" · "+_relData.rows.length+" registro(s)",14,32);
-  doc.autoTable({head:[_relData.head],body:_relData.rows,startY:38,styles:{fontSize:8},headStyles:{fillColor:[23,28,36],textColor:[235,239,244]}});
+  doc.autoTable({head:[_relData.head],body:_relData.rows,foot:(_relData.foot&&_relData.rows.length)?[_relData.foot.map(c=>String(c).replace(/³/g,"3"))]:undefined,startY:38,styles:{fontSize:8},headStyles:{fillColor:[23,28,36],textColor:[235,239,244]},footStyles:{fillColor:[230,233,238],textColor:[20,20,20],fontStyle:"bold"},showFoot:"lastPage"});
   doc.save(_relData.title.replace(/\s/g,"_")+".pdf");
   toast("PDF gerado");
 }
@@ -4027,7 +4030,7 @@ function exportFechamentoAbastPDF(){
   det.forEach(g=>{
     if(y>170){doc.addPage();y=18;}
     doc.setFontSize(10.5);doc.setTextColor(30);
-    doc.text((g.ger?"Gerador ":"")+g.nome+(g.placa?" · "+g.placa:""),14,y);
+    doc.text((g.ger && !/^gerador/i.test(g.nome)?"Gerador ":"")+g.nome+(g.placa?" · "+g.placa:""),14,y);
     doc.setFontSize(8.5);doc.setTextColor(100);
     doc.text(g.regs.length+" abastecimento(s) · "+qtdUnid(g.qtd)+" · "+fmtMoney(g.total),W-14,y,{align:"right"});
     y+=2;
@@ -4040,6 +4043,14 @@ function exportFechamentoAbastPDF(){
       didParseCell:alinhar({4:"right",5:"right",6:"right",7:"center",8:"right"})});
     y=doc.lastAutoTable.finalY+9;
   });
+
+  if(y>150){doc.addPage();y=18;}
+  doc.setFontSize(12);doc.setTextColor(30);doc.text("Total geral do mês — "+D.rotulo,14,y);
+  const linhasTot=[...D.viaturas,...D.geradores].map(g=>[(g.ger && !/^gerador/i.test(g.nome)?"Gerador ":"")+g.nome+(g.placa?" · "+g.placa:""),g.regs.length,qtdUnid(g.qtd),fmtMoney(g.total)]);
+  doc.autoTable({head:[["Viatura / Gerador","Abast.","Quantidade","Total"]],body:P(linhasTot),
+    foot:P([["TOTAL GERAL",D.tot.n,qtdUnid(D.tot.qtd),fmtMoney(D.tot.total)]]),
+    startY:y+3,styles:{fontSize:9},headStyles:HS,footStyles:{...FS,fontSize:10.5},margin:{left:14,right:14},
+    didParseCell:alinhar({1:"center",2:"right",3:"right"})});
 
   const np=doc.internal.getNumberOfPages();
   for(let i=1;i<=np;i++){ doc.setPage(i); doc.setFontSize(7.5); doc.setTextColor(140);
