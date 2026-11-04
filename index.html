@@ -3827,6 +3827,16 @@ ROUTES.relatorios=(el)=>{
       ${relBtn("baixas","🧾","Veículos sem baixa")}
       ${relBtn("calibragens","🛞","Calibragens")}
     </div>
+    <details class="filtros" id="rp-fab" open>
+      <summary>⛽ Fechamento mensal de abastecimento (PDF)</summary>
+      <div class="two">
+        <div><label>Mês</label><input id="rp-ab-mes" type="month" value="${mesAtualYM()}"></div>
+        <div style="display:flex;align-items:flex-end;gap:8px">
+          <button class="btn sm sec" onclick="previaFechamentoAbast()">👁 Ver</button>
+          <button class="btn sm" onclick="exportFechamentoAbastPDF()">📄 PDF</button></div>
+      </div>
+      <div class="hint">Total do mês + resumo e detalhamento por viatura (geradores em quadro separado). Respeita o filtro de veículo do topo.</div>
+    </details>
     <details class="filtros" id="rp-fbx">
       <summary>Filtros do relatório "Veículos sem baixa"</summary>
       <div class="three">
@@ -3918,6 +3928,125 @@ function exportRelPDF(){
   doc.setFontSize(8);doc.text("Gerado em "+dtBR(nowISO())+" por "+(SESSION?SESSION.nome:"—")+" · "+_relData.rows.length+" registro(s)",14,32);
   doc.autoTable({head:[_relData.head],body:_relData.rows,startY:38,styles:{fontSize:8},headStyles:{fillColor:[23,28,36],textColor:[235,239,244]}});
   doc.save(_relData.title.replace(/\s/g,"_")+".pdf");
+  toast("PDF gerado");
+}
+
+/* ============ FECHAMENTO MENSAL DE ABASTECIMENTO ============ */
+const MESES_BR=["Janeiro","Fevereiro","Março","Abril","Maio","Junho","Julho","Agosto","Setembro","Outubro","Novembro","Dezembro"];
+function mesAtualYM(){ const n=new Date(); return n.getFullYear()+"-"+String(n.getMonth()+1).padStart(2,"0"); }
+const fmtQtd=n=>(Number(n)||0).toLocaleString("pt-BR",{minimumFractionDigits:2,maximumFractionDigits:2});
+function qtdUnid(o){ return Object.keys(o).filter(u=>o[u]).map(u=>fmtQtd(o[u])+" "+u).join(" + ")||"—"; }
+
+function dadosFechamentoAbast(ym, vidFiltro){
+  const [ano,mes]=ym.split("-").map(Number);
+  const regs=DB.abastecimentos.filter(a=>{ if(!a.data) return false; const d=new Date(a.data);
+    return d.getFullYear()===ano && d.getMonth()===mes-1 && (!vidFiltro || a.veiculoId===vidFiltro); })
+    .sort((a,b)=>new Date(a.data)-new Date(b.data));
+  const grupos={};
+  regs.forEach(a=>{
+    const ger=a.tipo==="gerador";
+    const v=ger?null:veiculo(a.veiculoId);
+    const k=ger?"g:"+(a.gerador||"Gerador"):"v:"+(a.veiculoId||a.placa||"?");
+    if(!grupos[k]) grupos[k]={ger, nome: ger?(a.gerador||"Gerador"):(v?.interno||a.veiculoInterno||"—"),
+      placa: ger?(a.local||""):(v?.placa||a.placa||""), regs:[], qtd:{}, total:0, litrosPagos:0, valorLitros:0};
+    const g=grupos[k], u=unidadeAbast(a), q=+a.litros||0, t=+a.total||0;
+    g.regs.push(a); g.qtd[u]=(g.qtd[u]||0)+q; g.total+=t;
+    if(u==="L"){ g.litrosPagos+=q; g.valorLitros+=t; }
+  });
+  const lista=Object.values(grupos).sort((a,b)=>b.total-a.total);
+  const tot={n:regs.length,total:0,qtd:{}};
+  lista.forEach(g=>{ tot.total+=g.total; Object.keys(g.qtd).forEach(u=>tot.qtd[u]=(tot.qtd[u]||0)+g.qtd[u]); });
+  lista.forEach(g=>{
+    g.kms=g.regs.map(a=>+a.km||0).filter(x=>x>0);
+    g.kmIni=g.kms.length?Math.min(...g.kms):null; g.kmFim=g.kms.length?Math.max(...g.kms):null;
+    g.precoMedio=g.litrosPagos?g.valorLitros/g.litrosPagos:null;
+    g.pct=tot.total?g.total/tot.total*100:0;
+  });
+  return {ano,mes,rotulo:MESES_BR[mes-1]+"/"+ano,regs,viaturas:lista.filter(g=>!g.ger),geradores:lista.filter(g=>g.ger),tot};
+}
+function linhaResumo(g){ return [g.nome,g.placa||"—",g.regs.length,qtdUnid(g.qtd),g.precoMedio?fmtMoney(g.precoMedio):"—",
+  g.kmIni!=null?fmtNum(g.kmIni)+" – "+fmtNum(g.kmFim):"—",fmtMoney(g.total),g.pct.toFixed(1)+"%"]; }
+const HEAD_RESUMO=["Viatura","Placa","Abast.","Quantidade","R$/L médio","KM (1º – último)","Total","% do mês"];
+
+function previaFechamentoAbast(){
+  const ym=$("#rp-ab-mes").value; if(!ym){toast("Escolha o mês");return;}
+  const D=dadosFechamentoAbast(ym,$("#rp-veic").value);
+  const tab=(head,rows)=>`<div class="table-wrap"><table><thead><tr>${head.map(h=>`<th>${esc(h)}</th>`).join("")}</tr></thead>
+    <tbody>${rows.map(r=>`<tr>${r.map(c=>`<td>${esc(c)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
+  $("#rp-out").innerHTML=`<div class="section-title">Fechamento de abastecimento — ${esc(D.rotulo)} <span class="line"></span></div>
+    <div class="hint" style="margin:-4px 0 10px">${D.tot.n} abastecimento(s) · ${esc(qtdUnid(D.tot.qtd))} · <b>${fmtMoney(D.tot.total)}</b></div>
+    <div style="display:flex;gap:8px;margin-bottom:10px"><button class="btn sm" onclick="exportFechamentoAbastPDF()">📄 PDF</button></div>
+    ${D.tot.n?tab(HEAD_RESUMO,[...D.viaturas,...D.geradores].map(linhaResumo)):`<div class="empty"><div class="em">⛽</div>Nenhum abastecimento em ${esc(D.rotulo)}</div>`}`;
+}
+
+function exportFechamentoAbastPDF(){
+  if(!window.jspdf){ toast("O gerador de PDF não carregou. Confira a internet."); return; }
+  const ym=$("#rp-ab-mes").value; if(!ym){toast("Escolha o mês");return;}
+  const vid=$("#rp-veic").value;
+  const D=dadosFechamentoAbast(ym,vid);
+  if(!D.tot.n){ toast("Nenhum abastecimento em "+D.rotulo); return; }
+  const{jsPDF}=window.jspdf; const doc=new jsPDF({orientation:"landscape"});
+  const W=doc.internal.pageSize.getWidth();
+  const HS={fillColor:[23,28,36],textColor:[235,239,244],fontStyle:"bold"};
+  const FS={fillColor:[230,233,238],textColor:[20,20,20],fontStyle:"bold"};
+  const P=rows=>rows.map(r=>r.map(c=>typeof c==="string"?c.replace(/³/g,"3"):c));
+  const alinhar=al=>(d=>{ if(al[d.column.index]) d.cell.styles.halign=al[d.column.index]; });
+
+  doc.setFillColor(11,15,26);doc.rect(0,0,W,26,"F");
+  doc.setTextColor(225,229,235);doc.setFontSize(17);doc.text("VEGAS FROTA",14,13);
+  doc.setTextColor(200);doc.setFontSize(9);doc.text("Vegas Vigilância e Segurança — Controle de Frota · Base Niterói",14,20);
+  doc.setFontSize(13);doc.setTextColor(225,229,235);doc.text("Fechamento de Abastecimento — "+D.rotulo,W-14,15,{align:"right"});
+
+  doc.setTextColor(90);doc.setFontSize(8);
+  doc.text("Gerado em "+dtBR(nowISO())+" por "+(SESSION?SESSION.nome:"—")+(vid?" · Filtro: "+(veiculo(vid)?.interno||""):""),14,33);
+
+  const cards=[["Total gasto",fmtMoney(D.tot.total)],["Quantidade",qtdUnid(D.tot.qtd)],["Abastecimentos",String(D.tot.n)],
+    ["Viaturas",String(D.viaturas.length)],["Geradores",String(D.geradores.length)]];
+  const cw=(W-28-4*4)/5;
+  cards.forEach((c,i)=>{ const x=14+i*(cw+4);
+    doc.setDrawColor(210);doc.setFillColor(246,247,249);doc.roundedRect(x,37,cw,18,2,2,"FD");
+    doc.setFontSize(7.5);doc.setTextColor(110);doc.text(c[0].toUpperCase(),x+4,43);
+    doc.setFontSize(11.5);doc.setTextColor(20);doc.text(P([[c[1]]])[0][0],x+4,51,{maxWidth:cw-8}); });
+
+  let y=63;
+  const secao=(t)=>{ if(y>175){doc.addPage();y=18;} doc.setFontSize(11);doc.setTextColor(30);doc.text(t,14,y);y+=3; };
+  const somaQtd=gs=>{const o={};gs.forEach(g=>Object.keys(g.qtd).forEach(u=>o[u]=(o[u]||0)+g.qtd[u]));return o;};
+  const rodape=(gs,rot)=>[[rot,"",gs.reduce((s,g)=>s+g.regs.length,0),qtdUnid(somaQtd(gs)),"","",fmtMoney(gs.reduce((s,g)=>s+g.total,0)),
+    (D.tot.total?gs.reduce((s,g)=>s+g.total,0)/D.tot.total*100:0).toFixed(1)+"%"]];
+  const tabResumo=(gs,rot,h)=>{ doc.autoTable({head:[h],body:P(gs.map(linhaResumo)),foot:P(rodape(gs,rot)),startY:y,
+    styles:{fontSize:8.5},headStyles:HS,footStyles:FS,margin:{left:14,right:14},
+    didParseCell:alinhar({2:"center",3:"right",4:"right",5:"center",6:"right",7:"right"})});
+    y=doc.lastAutoTable.finalY+10; };
+
+  if(D.viaturas.length){ secao("Resumo por viatura"); tabResumo(D.viaturas,"Total viaturas",HEAD_RESUMO); }
+  if(D.geradores.length){ secao("Geradores"); tabResumo(D.geradores,"Total geradores",["Gerador","Local",...HEAD_RESUMO.slice(2)]); }
+
+  const det=[...D.viaturas,...D.geradores];
+  doc.addPage(); y=18;
+  doc.setFontSize(13);doc.setTextColor(30);doc.text("Detalhamento por viatura — "+D.rotulo,14,y); y+=8;
+  det.forEach(g=>{
+    if(y>170){doc.addPage();y=18;}
+    doc.setFontSize(10.5);doc.setTextColor(30);
+    doc.text((g.ger?"Gerador ":"")+g.nome+(g.placa?" · "+g.placa:""),14,y);
+    doc.setFontSize(8.5);doc.setTextColor(100);
+    doc.text(g.regs.length+" abastecimento(s) · "+qtdUnid(g.qtd)+" · "+fmtMoney(g.total),W-14,y,{align:"right"});
+    y+=2;
+    const body=g.regs.map(a=>{ const m=motorista(a.motoristaId); const u=unidadeAbast(a);
+      return [dtBR(a.data),m?.nome||a.registradoPor||"—",a.posto||"—",a.combustivel||"—",g.ger?"—":(a.km?fmtNum(a.km):"—"),
+        fmtQtd(a.litros)+" "+u,a.valorLitro?fmtMoney(a.valorLitro):"—",a.tanqueCheio?"Sim":"",fmtMoney(a.total)]; });
+    doc.autoTable({head:[["Data/Hora","Responsável","Posto","Combustível","KM","Qtd.","R$/un.","Tq. cheio","Total"]],body:P(body),
+      foot:P([["Subtotal","","","","",qtdUnid(g.qtd),g.precoMedio?fmtMoney(g.precoMedio)+"/L":"","",fmtMoney(g.total)]]),
+      startY:y+1,styles:{fontSize:8},headStyles:HS,footStyles:FS,margin:{left:14,right:14},
+      didParseCell:alinhar({4:"right",5:"right",6:"right",7:"center",8:"right"})});
+    y=doc.lastAutoTable.finalY+9;
+  });
+
+  const np=doc.internal.getNumberOfPages();
+  for(let i=1;i<=np;i++){ doc.setPage(i); doc.setFontSize(7.5); doc.setTextColor(140);
+    doc.text("VEGAS FROTA · Base Niterói · Fechamento de Abastecimento "+D.rotulo,14,doc.internal.pageSize.getHeight()-7);
+    doc.text("Página "+i+" de "+np,W-14,doc.internal.pageSize.getHeight()-7,{align:"right"}); }
+
+  doc.save("Fechamento_Abastecimento_Niteroi_"+ym+(vid?"_"+(veiculo(vid)?.interno||"").replace(/\W+/g,""):"")+".pdf");
   toast("PDF gerado");
 }
 
